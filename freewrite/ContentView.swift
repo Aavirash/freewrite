@@ -2582,6 +2582,7 @@ struct GhostTextView: NSViewRepresentable {
         private var lastArmed = false
         private var observers: [NSObjectProtocol] = []
         private var lastCenter = false
+        private var lastCaretRect: CGRect = .zero
 
         init(_ parent: GhostTextView) {
             self.parent = parent
@@ -2918,11 +2919,11 @@ struct GhostTextView: NSViewRepresentable {
                   let lm = tv.layoutManager, let tc = tv.textContainer else { return }
             lm.ensureLayout(for: tc)
             let contentHeight = lm.usedRect(for: tc).height
-            let available = scroll.contentSize.height
+            let available = scroll.contentView.bounds.height
             var inset: CGFloat = 0
             if parent.centerContent, contentHeight < available {
                 // Sit a touch above true center — reads better on tall screens.
-                inset = max(0, (available - contentHeight) * 0.42)
+                inset = max(0, (available - contentHeight) * 0.40)
             }
             if abs(tv.textContainerInset.height - inset) > 0.5 {
                 tv.textContainerInset = NSSize(width: 0, height: inset)
@@ -2934,7 +2935,7 @@ struct GhostTextView: NSViewRepresentable {
                 tv.needsDisplay = true
             }
             if abs(parent.contentTopInset - inset) > 0.5 {
-                parent.contentTopInset = inset
+                publishState { [weak self] in self?.parent.contentTopInset = inset }
                 updateCaretRect()
             }
         }
@@ -2956,14 +2957,27 @@ struct GhostTextView: NSViewRepresentable {
             rect.origin.y += origin.y
             let inClip = tv.convert(rect, to: scroll.contentView)
             let caretX = loc > 0 ? inClip.maxX : inClip.minX
-            parent.caretRect = CGRect(x: caretX, y: inClip.minY, width: 1, height: max(inClip.height, 1))
+            let rect = CGRect(x: caretX, y: inClip.minY, width: 1, height: max(inClip.height, 1))
+            if rect != lastCaretRect {
+                lastCaretRect = rect
+                publishState { [weak self] in self?.parent.caretRect = rect }
+            }
+        }
+
+        /// SwiftUI ignores state written from inside an AppKit view update, so
+        /// hop to the next runloop tick before mutating bindings.
+        private func publishState(_ body: @escaping () -> Void) {
+            DispatchQueue.main.async(execute: body)
         }
 
         // MARK: Styling
 
         private func setPhase(_ newPhase: Phase) {
             phase = newPhase
-            parent.thinking = (newPhase == .thinking)
+            let isThinking = (newPhase == .thinking)
+            if isThinking != parent.thinking {
+                publishState { [weak self] in self?.parent.thinking = isThinking }
+            }
             applyCaret()
         }
 
