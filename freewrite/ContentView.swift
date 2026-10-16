@@ -17,6 +17,11 @@ enum EntryType {
     case video
 }
 
+enum EditorAlignment: String {
+    case top
+    case center
+}
+
 struct HumanEntry: Identifiable {
     let id: UUID
     let date: String
@@ -139,9 +144,12 @@ struct ContentView: View {
     @State private var videoPermissionPopoverItems: [VideoPermissionPopoverItem] = []
     @State private var videoPermissionPopoverFallbackMessage: String? = nil
     @State private var keyboardMonitor: Any? = nil
-    @State private var lightBox = LightBoxController()
     @State private var ghostArmed = false
     @State private var ghostEngine = GhostEngineBox()
+    @State private var editorAlignment: EditorAlignment = .center
+    @State private var caretRect: CGRect = .zero
+    @State private var isHoveringAlignment = false
+    @StateObject private var muse = MuseChatModel()
     let timer = Timer.publish(every: 1, on: .main, in: .common).autoconnect()
     let entryHeight: CGFloat = 40
     
@@ -235,6 +243,12 @@ struct ContentView: View {
         // Load saved color scheme preference
         let savedScheme = UserDefaults.standard.string(forKey: "colorScheme") ?? "light"
         _colorScheme = State(initialValue: savedScheme == "dark" ? .dark : .light)
+
+        // Load saved editor vertical alignment
+        if let savedAlignment = UserDefaults.standard.string(forKey: "editorAlignment"),
+           let alignment = EditorAlignment(rawValue: savedAlignment) {
+            _editorAlignment = State(initialValue: alignment)
+        }
     }
     
     // Modify getDocumentsDirectory to use cached value
@@ -898,10 +912,20 @@ struct ContentView: View {
                         lineSpacing: lineHeight,
                         isDark: colorScheme == .dark,
                         armed: $ghostArmed,
-                        engine: ghostEngine
+                        engine: ghostEngine,
+                        centerContent: editorAlignment == .center,
+                        caretRect: $caretRect,
+                        onGhostClicked: { openMuse() }
                     )
                     .background(Color(colorScheme == .light ? .white : .black))
                     .frame(maxWidth: 650)
+                    .overlay(alignment: .topLeading) {
+                        if muse.isOpen {
+                            InlineChatPanel(model: muse, isDark: colorScheme == .dark)
+                                .offset(x: musePanelX, y: musePanelY)
+                                .transition(.opacity)
+                        }
+                    }
                     .padding(.top, 40)
                     .padding(.bottom, bottomNavOpacity > 0 ? navHeight : 0)
                     .onAppear {
@@ -1391,6 +1415,28 @@ struct ContentView: View {
                                     .foregroundColor(.gray)
                             }
 
+                            Button(action: {
+                                editorAlignment = editorAlignment == .top ? .center : .top
+                                UserDefaults.standard.set(editorAlignment.rawValue, forKey: "editorAlignment")
+                            }) {
+                                Image(systemName: editorAlignment == .top ? "align.vertical.top" : "align.vertical.center")
+                                    .foregroundColor(isHoveringAlignment ? textHoverColor : textColor)
+                            }
+                            .buttonStyle(.plain)
+                            .help(editorAlignment == .top ? "Text starts at the top" : "Text starts from the center")
+                            .onHover { hovering in
+                                isHoveringAlignment = hovering
+                                isHoveringBottomNav = hovering
+                                if hovering {
+                                    NSCursor.pointingHand.push()
+                                } else {
+                                    NSCursor.pop()
+                                }
+                            }
+
+                            Text("•")
+                                .foregroundColor(.gray)
+
                             Button(isFullscreen ? "Minimize" : "Fullscreen") {
                                 if let window = NSApplication.shared.windows.first {
                                     window.toggleFullScreen(nil)
@@ -1706,7 +1752,6 @@ struct ContentView: View {
             showingSidebar = false  // Hide sidebar by default
             loadExistingEntries()
             installKeyboardShortcuts()
-            lightBox.start()
         }
         .onDisappear {
             if let keyboardMonitor {
@@ -1920,6 +1965,13 @@ struct ContentView: View {
             guard ghostEngine.isAvailable else { return nil }
             ghostArmed.toggle()
             return nil
+        case "j":
+            if muse.isOpen {
+                muse.close()
+            } else {
+                openMuse()
+            }
+            return nil
         default:
             return event
         }
@@ -1940,6 +1992,27 @@ struct ContentView: View {
             selectedFont = randomFont
             currentRandomFont = randomFont
         }
+    }
+
+    private var musePanelX: CGFloat {
+        let width: CGFloat = 320
+        let maxX = max(0, 650 - width)
+        if caretRect == .zero { return maxX }
+        return min(max(caretRect.minX, 0), maxX)
+    }
+
+    private var musePanelY: CGFloat {
+        if caretRect == .zero { return 160 }
+        return caretRect.maxY + 8
+    }
+
+    private func openMuse() {
+        guard muse.engineAvailable else { return }
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        ghostEngine.cancel()
+        ghostArmed = false
+        muse.open(context: trimmed)
     }
 
     private func openChatGPT() {
@@ -2291,122 +2364,6 @@ struct ContentView: View {
     }
 }
 
-// Light box: a full-screen backdrop window that sits just behind the main
-// window and blurs + dims everything behind it. Shown only while the main
-// window is windowed (never in fullscreen) and the app is active.
-final class LightBoxController {
-    private var backdropWindow: NSWindow?
-    private weak var mainWindow: NSWindow?
-    private var observers: [NSObjectProtocol] = []
-    private var isRunning = false
-
-    private let dimAlpha: CGFloat = 0.5
-
-    func start() {
-        guard !isRunning else { return }
-        guard let window = NSApp.windows.first else { return }
-        isRunning = true
-        mainWindow = window
-        backdropWindow = makeBackdropWindow(for: window)
-        installObservers()
-        update()
-    }
-
-    func stop() {
-        observers.forEach { NotificationCenter.default.removeObserver($0) }
-        observers.removeAll()
-        backdropWindow?.orderOut(nil)
-        backdropWindow?.close()
-        backdropWindow = nil
-        isRunning = false
-    }
-
-    private func makeBackdropWindow(for main: NSWindow) -> NSWindow {
-        let frame = main.screen?.frame ?? NSScreen.main?.frame ?? .zero
-        let window = NSWindow(
-            contentRect: frame,
-            styleMask: [.borderless],
-            backing: .buffered,
-            defer: false
-        )
-        window.isOpaque = false
-        window.backgroundColor = .clear
-        window.hasShadow = false
-        window.ignoresMouseEvents = true
-        window.isReleasedWhenClosed = false
-        window.level = .normal
-        window.collectionBehavior = [.stationary, .ignoresCycle, .fullScreenAuxiliary]
-
-        let effect = NSVisualEffectView(frame: NSRect(origin: .zero, size: frame.size))
-        effect.autoresizingMask = [.width, .height]
-        effect.material = .fullScreenUI
-        effect.blendingMode = .behindWindow
-        effect.state = .active
-        window.contentView = effect
-
-        let dim = NSView(frame: effect.bounds)
-        dim.autoresizingMask = [.width, .height]
-        dim.wantsLayer = true
-        dim.layer?.backgroundColor = NSColor.black.withAlphaComponent(dimAlpha).cgColor
-        effect.addSubview(dim)
-
-        return window
-    }
-
-    private func installObservers() {
-        let center = NotificationCenter.default
-        let main = mainWindow
-
-        observers.append(center.addObserver(forName: NSApplication.didBecomeActiveNotification, object: nil, queue: .main) { [weak self] _ in
-            self?.update()
-        })
-        observers.append(center.addObserver(forName: NSApplication.didResignActiveNotification, object: nil, queue: .main) { [weak self] _ in
-            self?.update()
-        })
-
-        let windowNotifications: [Notification.Name] = [
-            NSWindow.didEnterFullScreenNotification,
-            NSWindow.didExitFullScreenNotification,
-            NSWindow.didMiniaturizeNotification,
-            NSWindow.didDeminiaturizeNotification,
-            NSWindow.didChangeScreenNotification,
-            NSWindow.didBecomeKeyNotification
-        ]
-        for name in windowNotifications {
-            observers.append(center.addObserver(forName: name, object: main, queue: .main) { [weak self] _ in
-                self?.update()
-            })
-        }
-    }
-
-    private func update() {
-        guard let backdrop = backdropWindow, let main = mainWindow else { return }
-
-        let isFullScreen = main.styleMask.contains(.fullScreen)
-        let shouldShow = NSApp.isActive && main.isVisible && !main.isMiniaturized && !isFullScreen
-
-        if shouldShow {
-            let frame = main.screen?.frame ?? NSScreen.main?.frame ?? .zero
-            if backdrop.frame != frame {
-                backdrop.setFrame(frame, display: true)
-            }
-
-            // Sit above the Dock (and other apps) but below the menu bar.
-            let dockLevel = Int(CGWindowLevelForKey(.dockWindow))
-            backdrop.level = NSWindow.Level(rawValue: dockLevel + 1)
-            if main.level.rawValue <= dockLevel {
-                main.level = NSWindow.Level(rawValue: dockLevel + 2)
-            }
-            backdrop.order(.below, relativeTo: main.windowNumber)
-        } else {
-            backdrop.orderOut(nil)
-            if !isFullScreen && main.level != .normal {
-                main.level = .normal
-            }
-        }
-    }
-}
-
 // MARK: - Ghost writing (on-device Apple Intelligence)
 
 /// Type-erased wrapper so the rest of the app doesn't need availability checks.
@@ -2487,7 +2444,7 @@ final class GhostEngine {
 final class GhostNSTextView: NSTextView {
     var onTab: (() -> Bool)?
     var onEscape: (() -> Bool)?
-    var onMouseDown: (() -> Void)?
+    var onMouseDown: ((NSEvent) -> Bool)?
 
     override func keyDown(with event: NSEvent) {
         let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
@@ -2497,7 +2454,7 @@ final class GhostNSTextView: NSTextView {
     }
 
     override func mouseDown(with event: NSEvent) {
-        onMouseDown?()
+        if onMouseDown?(event) == true { return }
         super.mouseDown(with: event)
     }
 }
@@ -2512,6 +2469,9 @@ struct GhostTextView: NSViewRepresentable {
     let isDark: Bool
     @Binding var armed: Bool
     let engine: GhostEngineBox
+    let centerContent: Bool
+    @Binding var caretRect: CGRect
+    let onGhostClicked: () -> Void
 
     func makeCoordinator() -> Coordinator { Coordinator(self) }
 
@@ -2559,9 +2519,11 @@ struct GhostTextView: NSViewRepresentable {
         textView.onEscape = { [weak coordinator = context.coordinator] in
             coordinator?.escapePressed() ?? false
         }
-        textView.onMouseDown = { [weak coordinator = context.coordinator] in
-            coordinator?.clearGhostForClick()
+        textView.onMouseDown = { [weak coordinator = context.coordinator] event in
+            coordinator?.handleMouseDown(event) ?? false
         }
+
+        context.coordinator.installObservers(initialText: text)
 
         DispatchQueue.main.async {
             textView.window?.makeFirstResponder(textView)
@@ -2575,7 +2537,7 @@ struct GhostTextView: NSViewRepresentable {
     }
 
     static func dismantleNSView(_ nsView: NSScrollView, coordinator: Coordinator) {
-        coordinator.parent.engine.cancel()
+        coordinator.tearDown()
     }
 
     final class Coordinator: NSObject, NSTextViewDelegate {
@@ -2592,9 +2554,86 @@ struct GhostTextView: NSViewRepresentable {
         private var lastStyleKey = ""
         private var lastArmed = false
         private var isGenerating = false
+        private var observers: [NSObjectProtocol] = []
+        private var lastCenter = false
 
         init(_ parent: GhostTextView) {
             self.parent = parent
+        }
+
+        func installObservers(initialText: String) {
+            lastCenter = parent.centerContent
+            applyStyle()
+            applyCaret()
+            if let tv = textView, let scroll = tv.enclosingScrollView {
+                scroll.contentView.postsBoundsChangedNotifications = true
+                let center = NotificationCenter.default
+                observers.append(center.addObserver(forName: NSView.frameDidChangeNotification, object: scroll, queue: .main) { [weak self] _ in
+                    self?.recomputeInsets()
+                    self?.updateCaretRect()
+                })
+                observers.append(center.addObserver(forName: NSView.boundsDidChangeNotification, object: scroll.contentView, queue: .main) { [weak self] _ in
+                    self?.updateCaretRect()
+                })
+            }
+            recomputeInsets()
+            updateCaretRect()
+        }
+
+        func tearDown() {
+            parent.engine.cancel()
+            observers.forEach { NotificationCenter.default.removeObserver($0) }
+            observers.removeAll()
+        }
+
+        func textViewDidChangeSelection(_ notification: Notification) {
+            updateCaretRect()
+        }
+
+        /// Keeps the caret rect (in the editor's coordinate space) up to date for
+        /// anchoring the inline chat, and paints the vertical alignment inset.
+        private func recomputeInsets() {
+            guard let tv = textView, let scroll = tv.enclosingScrollView,
+                  let lm = tv.layoutManager, let tc = tv.textContainer else { return }
+            lm.ensureLayout(for: tc)
+            let contentHeight = lm.usedRect(for: tc).height
+            let available = scroll.contentSize.height
+            var inset: CGFloat = 0
+            if parent.centerContent, contentHeight < available {
+                inset = (available - contentHeight) / 2
+            }
+            if abs(tv.textContainerInset.height - inset) > 0.5 {
+                tv.textContainerInset = NSSize(width: 0, height: inset)
+            }
+        }
+
+        private func updateCaretRect() {
+            guard let tv = textView, let scroll = tv.enclosingScrollView else {
+                parent.caretRect = .zero
+                return
+            }
+            let length = (tv.string as NSString).length
+            let sel = tv.selectedRange()
+            let loc = min(sel.location == NSNotFound ? 0 : sel.location, length)
+            let probe = loc > 0 ? NSRange(location: loc - 1, length: 1) : NSRange(location: 0, length: 0)
+            let rect = tv.firstRect(forCharacterRange: probe, actualRange: nil)
+            let clip = scroll.contentView
+            let caretX = loc > 0 ? rect.maxX : rect.minX
+            let visible = CGRect(x: caretX, y: rect.minY, width: 1, height: max(rect.height, 1))
+                .offsetBy(dx: -clip.bounds.origin.x, dy: -clip.bounds.origin.y)
+            parent.caretRect = visible
+        }
+
+        func handleMouseDown(_ event: NSEvent) -> Bool {
+            guard let tv = textView, let gr = ghostRange else { return false }
+            let point = tv.convert(event.locationInWindow, from: nil)
+            let index = tv.characterIndexForInsertion(at: point)
+            if NSLocationInRange(index, gr) {
+                parent.onGhostClicked()
+                return true
+            }
+            clearGhostForClick()
+            return false
         }
 
         func onSetup(initialText: String) {
@@ -2610,7 +2649,7 @@ struct GhostTextView: NSViewRepresentable {
         }
 
         func refresh() {
-            guard let tv = textView else { return }
+            guard textView != nil else { return }
             let styleKey = "\(parent.fontName)|\(parent.fontSize)|\(parent.isDark)|\(parent.lineSpacing)"
             if styleKey != lastStyleKey {
                 applyStyle()
@@ -2627,8 +2666,12 @@ struct GhostTextView: NSViewRepresentable {
                 isGenerating = false
             }
             lastArmed = parent.armed
+            if parent.centerContent != lastCenter {
+                lastCenter = parent.centerContent
+                recomputeInsets()
+            }
             applyCaret()
-            _ = tv
+            updateCaretRect()
         }
 
         // MARK: NSTextViewDelegate
@@ -2639,6 +2682,8 @@ struct GhostTextView: NSViewRepresentable {
             let real = tv.string
             lastReportedText = real
             parent.text = real
+            recomputeInsets()
+            updateCaretRect()
             scheduleSuggestion()
         }
 
@@ -2823,6 +2868,226 @@ struct GhostTextView: NSViewRepresentable {
             let clipped = text.count <= limit ? text : String(text.suffix(limit))
             return "My writing so far:\n\n\(clipped)\n\nContinue from exactly where this leaves off."
         }
+    }
+}
+
+// MARK: - Inline ghost chat ("Muse", on-device Apple Intelligence)
+
+struct MuseTurn: Identifiable {
+    enum Role { case user, assistant }
+    let id = UUID()
+    let role: Role
+    let text: String
+}
+
+/// Type-erased wrapper so ContentView doesn't need availability checks.
+final class MuseEngineBox {
+    let isAvailable: Bool
+    private let sendImpl: (String, String?, @escaping (String) -> Void, @escaping () -> Void) -> Void
+    private let cancelImpl: () -> Void
+
+    init() {
+        if #available(macOS 26.0, *) {
+            let engine = MuseEngine()
+            isAvailable = engine.isAvailable
+            sendImpl = { prompt, context, onUpdate, onDone in
+                engine.send(prompt: prompt, context: context, onUpdate: onUpdate, onDone: onDone)
+            }
+            cancelImpl = { engine.cancel() }
+        } else {
+            isAvailable = false
+            sendImpl = { _, _, _, onDone in onDone() }
+            cancelImpl = {}
+        }
+    }
+
+    func send(prompt: String, context: String?, onUpdate: @escaping (String) -> Void, onDone: @escaping () -> Void) {
+        sendImpl(prompt, context, onUpdate, onDone)
+    }
+
+    func cancel() { cancelImpl() }
+}
+
+@available(macOS 26.0, *)
+final class MuseEngine {
+    private var task: Task<Void, Never>?
+    private var session: LanguageModelSession?
+
+    static let instructions = """
+    You are a warm, perceptive writing companion inside a minimal freewriting app. \
+    You read what someone freewrote and respond like an old friend — casual and human, never clinical. \
+    Help them see connections they might miss, comfort, and gently challenge. \
+    Keep it short: a few sentences, no headings, no lists, no therapy-speak.
+    """
+
+    var isAvailable: Bool { SystemLanguageModel.default.isAvailable }
+
+    func cancel() {
+        task?.cancel()
+        task = nil
+    }
+
+    func send(prompt: String, context: String?, onUpdate: @escaping (String) -> Void, onDone: @escaping () -> Void) {
+        cancel()
+        guard case .available = SystemLanguageModel.default.availability else {
+            onDone()
+            return
+        }
+        let session: LanguageModelSession
+        if let existing = self.session {
+            session = existing
+        } else {
+            session = LanguageModelSession(instructions: MuseEngine.instructions)
+            self.session = session
+        }
+        let fullPrompt: String
+        if let context {
+            fullPrompt = "Here is my freewriting so far:\n\n\(context)\n\n\(prompt)"
+        } else {
+            fullPrompt = prompt
+        }
+        task = Task {
+            do {
+                let stream = session.streamResponse(to: fullPrompt)
+                for try await partial in stream {
+                    if Task.isCancelled { return }
+                    let text = partial.content
+                    await MainActor.run { onUpdate(text) }
+                }
+            } catch {
+                await MainActor.run { self.session = nil }
+            }
+            await MainActor.run { onDone() }
+        }
+    }
+}
+
+final class MuseChatModel: ObservableObject {
+    @Published var isOpen = false
+    @Published var input = ""
+    @Published var turns: [MuseTurn] = []
+    @Published var streamingText = ""
+    @Published var isThinking = false
+
+    let engineAvailable: Bool
+    private let engine = MuseEngineBox()
+
+    init() {
+        engineAvailable = engine.isAvailable
+    }
+
+    func open(context: String) {
+        isOpen = true
+        turns = []
+        streamingText = ""
+        input = ""
+        request(
+            prompt: "Reflect on what I've written so far — a short, warm note — then ask me one question.",
+            context: context
+        )
+    }
+
+    func send() {
+        let message = input.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !message.isEmpty else { return }
+        input = ""
+        turns.append(MuseTurn(role: .user, text: message))
+        request(prompt: message, context: nil)
+    }
+
+    func close() {
+        isOpen = false
+        engine.cancel()
+        streamingText = ""
+        isThinking = false
+    }
+
+    private func request(prompt: String, context: String?) {
+        isThinking = true
+        streamingText = ""
+        engine.send(prompt: prompt, context: context, onUpdate: { [weak self] partial in
+            self?.streamingText = partial
+        }, onDone: { [weak self] in
+            guard let self else { return }
+            if !self.streamingText.isEmpty {
+                self.turns.append(MuseTurn(role: .assistant, text: self.streamingText))
+            }
+            self.streamingText = ""
+            self.isThinking = false
+        })
+    }
+}
+
+struct InlineChatPanel: View {
+    @ObservedObject var model: MuseChatModel
+    let isDark: Bool
+    @FocusState private var inputFocused: Bool
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                Text("Muse")
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundColor(.secondary)
+                Spacer()
+                Button(action: { model.close() }) {
+                    Image(systemName: "xmark")
+                        .font(.system(size: 10, weight: .semibold))
+                }
+                .buttonStyle(.plain)
+                .foregroundColor(.secondary)
+            }
+
+            ScrollView {
+                VStack(alignment: .leading, spacing: 8) {
+                    ForEach(model.turns) { turn in
+                        Text(turn.text)
+                            .font(.system(size: 13))
+                            .foregroundColor(turn.role == .user ? .secondary : .primary)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                    if !model.streamingText.isEmpty {
+                        Text(model.streamingText)
+                            .font(.system(size: 13))
+                            .foregroundColor(.primary)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                    } else if model.isThinking {
+                        Text("…")
+                            .font(.system(size: 13))
+                            .foregroundColor(.secondary)
+                    }
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            .frame(maxHeight: 180)
+
+            HStack(spacing: 8) {
+                TextField("Ask about this…", text: $model.input)
+                    .textFieldStyle(.plain)
+                    .font(.system(size: 13))
+                    .focused($inputFocused)
+                    .onSubmit { model.send() }
+                Button(action: { model.send() }) {
+                    Image(systemName: "arrow.up.circle.fill")
+                        .font(.system(size: 16))
+                }
+                .buttonStyle(.plain)
+                .foregroundColor(.accentColor)
+            }
+        }
+        .padding(12)
+        .frame(width: 320)
+        .background(
+            RoundedRectangle(cornerRadius: 12)
+                .fill(isDark ? Color(white: 0.12) : Color.white)
+                .shadow(color: .black.opacity(isDark ? 0.5 : 0.15), radius: 12, y: 4)
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 12)
+                .stroke(Color.gray.opacity(0.18), lineWidth: 1)
+        )
+        .onExitCommand { model.close() }
+        .onAppear { inputFocused = true }
     }
 }
 
