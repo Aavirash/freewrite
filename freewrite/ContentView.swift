@@ -149,6 +149,7 @@ struct ContentView: View {
     @State private var editorAlignment: EditorAlignment = .center
     @State private var caretRect: CGRect = .zero
     @State private var ghostThinking = false
+    @State private var editorTopInset: CGFloat = 0
     @State private var glowPulse = false
     @State private var isHoveringAlignment = false
     let timer = Timer.publish(every: 1, on: .main, in: .common).autoconnect()
@@ -916,7 +917,8 @@ struct ContentView: View {
                         engine: ghostEngine,
                         centerContent: editorAlignment == .center,
                         caretRect: $caretRect,
-                        thinking: $ghostThinking
+                        thinking: $ghostThinking,
+                        contentTopInset: $editorTopInset
                     )
                     .background(Color(colorScheme == .light ? .white : .black))
                     .frame(maxWidth: 650)
@@ -955,7 +957,7 @@ struct ContentView: View {
                                     .font(.custom(selectedFont, size: fontSize))
                                     .foregroundColor(colorScheme == .light ? .gray.opacity(0.5) : .gray.opacity(0.6))
                                     .allowsHitTesting(false)
-                                    .offset(x: 5, y: 40)
+                                    .offset(x: 5, y: 40 + editorTopInset)
                             }
                         }, alignment: .topLeading
                     )
@@ -2485,6 +2487,7 @@ struct GhostTextView: NSViewRepresentable {
     let centerContent: Bool
     @Binding var caretRect: CGRect
     @Binding var thinking: Bool
+    @Binding var contentTopInset: CGFloat
 
     func makeCoordinator() -> Coordinator { Coordinator(self) }
 
@@ -2921,6 +2924,9 @@ struct GhostTextView: NSViewRepresentable {
             }
             if abs(tv.textContainerInset.height - inset) > 0.5 {
                 tv.textContainerInset = NSSize(width: 0, height: inset)
+            }
+            if abs(parent.contentTopInset - inset) > 0.5 {
+                parent.contentTopInset = inset
             }
         }
 
