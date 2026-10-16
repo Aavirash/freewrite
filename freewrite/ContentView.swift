@@ -2957,10 +2957,10 @@ struct GhostTextView: NSViewRepresentable {
             rect.origin.y += origin.y
             let inClip = tv.convert(rect, to: scroll.contentView)
             let caretX = loc > 0 ? inClip.maxX : inClip.minX
-            let rect = CGRect(x: caretX, y: inClip.minY, width: 1, height: max(inClip.height, 1))
-            if rect != lastCaretRect {
-                lastCaretRect = rect
-                publishState { [weak self] in self?.parent.caretRect = rect }
+            let caretRect = CGRect(x: caretX, y: inClip.minY, width: 1, height: max(inClip.height, 1))
+            if caretRect != lastCaretRect {
+                lastCaretRect = caretRect
+                publishState { [weak self] in self?.parent.caretRect = caretRect }
             }
         }
 
