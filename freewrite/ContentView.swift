@@ -2647,6 +2647,7 @@ struct GhostTextView: NSViewRepresentable {
             if parent.centerContent != lastCenter {
                 lastCenter = parent.centerContent
                 recomputeInsets()
+                tv.window?.makeFirstResponder(tv)
             }
             applyCaret()
             updateCaretRect()
@@ -2920,13 +2921,21 @@ struct GhostTextView: NSViewRepresentable {
             let available = scroll.contentSize.height
             var inset: CGFloat = 0
             if parent.centerContent, contentHeight < available {
-                inset = (available - contentHeight) / 2
+                // Sit a touch above true center — reads better on tall screens.
+                inset = max(0, (available - contentHeight) * 0.42)
             }
             if abs(tv.textContainerInset.height - inset) > 0.5 {
                 tv.textContainerInset = NSSize(width: 0, height: inset)
+                // Force the caret and text to relocate together on toggle.
+                lm.ensureLayout(for: tc)
+                let sel = tv.selectedRange()
+                tv.setSelectedRange(NSRange(location: sel.location, length: 0))
+                tv.scrollRangeToVisible(sel)
+                tv.needsDisplay = true
             }
             if abs(parent.contentTopInset - inset) > 0.5 {
                 parent.contentTopInset = inset
+                updateCaretRect()
             }
         }
 
