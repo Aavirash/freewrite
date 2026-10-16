@@ -137,6 +137,7 @@ struct ContentView: View {
     @State private var showingVideoPermissionPopover = false
     @State private var videoPermissionPopoverItems: [VideoPermissionPopoverItem] = []
     @State private var videoPermissionPopoverFallbackMessage: String? = nil
+    @State private var keyboardMonitor: Any? = nil
     let timer = Timer.publish(every: 1, on: .main, in: .common).autoconnect()
     let entryHeight: CGFloat = 40
     
@@ -901,16 +902,6 @@ struct ContentView: View {
                     .onAppear {
                         placeholderText = placeholderOptions.randomElement() ?? "Begin writing"
                         // Removed findSubview code which was causing errors
-
-                        // Add keyboard monitor for backspace/delete keys
-                        NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
-                            // Check if backspace is disabled and the key is delete/backspace
-                            if backspaceDisabled && (event.keyCode == 51 || event.keyCode == 117) {
-                                // Block the backspace/delete key
-                                return nil
-                            }
-                            return event
-                        }
                     }
                     .overlay(
                         ZStack(alignment: .topLeading) {
@@ -1710,6 +1701,13 @@ struct ContentView: View {
         .onAppear {
             showingSidebar = false  // Hide sidebar by default
             loadExistingEntries()
+            installKeyboardShortcuts()
+        }
+        .onDisappear {
+            if let keyboardMonitor {
+                NSEvent.removeMonitor(keyboardMonitor)
+                self.keyboardMonitor = nil
+            }
         }
         .onChange(of: showingVideoRecording) { _, isShowing in
             if !isShowing {
@@ -1867,6 +1865,67 @@ struct ContentView: View {
         }
     }
     
+    private func installKeyboardShortcuts() {
+        guard keyboardMonitor == nil else { return }
+        keyboardMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
+            handleKeyEvent(event)
+        }
+    }
+
+    private func handleKeyEvent(_ event: NSEvent) -> NSEvent? {
+        // Backspace / forward-delete lock
+        if backspaceDisabled && (event.keyCode == 51 || event.keyCode == 117) {
+            return nil
+        }
+
+        // ` / ~ key toggles the theme
+        if event.keyCode == 50 {
+            toggleTheme()
+            return nil
+        }
+
+        guard event.modifierFlags.contains(.command) else { return event }
+
+        switch event.charactersIgnoringModifiers?.lowercased() {
+        case "n":
+            createNewEntry()
+            return nil
+        case "b":
+            backspaceDisabled.toggle()
+            return nil
+        case "f":
+            toggleFullScreen()
+            return nil
+        case "r":
+            randomizeFont()
+            return nil
+        case "y":
+            withAnimation(.easeInOut(duration: 0.2)) {
+                showingSidebar.toggle()
+            }
+            return nil
+        default:
+            return event
+        }
+    }
+
+    private func toggleTheme() {
+        colorScheme = colorScheme == .light ? .dark : .light
+        UserDefaults.standard.set(colorScheme == .light ? "light" : "dark", forKey: "colorScheme")
+    }
+
+    private func toggleFullScreen() {
+        let window = NSApp.keyWindow ?? NSApplication.shared.windows.first
+        window?.toggleFullScreen(nil)
+    }
+
+    private func randomizeFont() {
+        if let randomFont = availableFonts.randomElement() {
+            selectedFont = randomFont
+            currentRandomFont = randomFont
+        }
+    }
+
     private func openChatGPT() {
         let fullText = aiChatPrompt + "\n\n" + currentChatSourceText()
         

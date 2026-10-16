@@ -29,6 +29,10 @@ struct freewriteApp: App {
         .defaultSize(width: 1100, height: 600)
         .windowToolbarStyle(.unifiedCompact)
         .windowResizability(.contentSize)
+        .commands {
+            // Freewrite uses ⌘N for "New Entry", not "New Window".
+            CommandGroup(replacing: .newItem) { }
+        }
     }
 }
 
