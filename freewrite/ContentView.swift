@@ -1901,6 +1901,13 @@ struct ContentView: View {
         case "r":
             randomizeFont()
             return nil
+        case "t":
+            timerIsRunning.toggle()
+            return nil
+        case "o":
+            guard !isPreparingVideoRecording, !showingVideoRecording else { return nil }
+            startVideoRecordingPreflight()
+            return nil
         case "y":
             withAnimation(.easeInOut(duration: 0.2)) {
                 showingSidebar.toggle()
@@ -2286,7 +2293,7 @@ final class LightBoxController {
     private var observers: [NSObjectProtocol] = []
     private var isRunning = false
 
-    private let dimAlpha: CGFloat = 0.22
+    private let dimAlpha: CGFloat = 0.5
 
     func start() {
         guard !isRunning else { return }
@@ -2376,9 +2383,19 @@ final class LightBoxController {
             if backdrop.frame != frame {
                 backdrop.setFrame(frame, display: true)
             }
+
+            // Sit above the Dock (and other apps) but below the menu bar.
+            let dockLevel = Int(CGWindowLevelForKey(.dockWindow))
+            backdrop.level = NSWindow.Level(rawValue: dockLevel + 1)
+            if main.level.rawValue <= dockLevel {
+                main.level = NSWindow.Level(rawValue: dockLevel + 2)
+            }
             backdrop.order(.below, relativeTo: main.windowNumber)
         } else {
             backdrop.orderOut(nil)
+            if !isFullScreen && main.level != .normal {
+                main.level = .normal
+            }
         }
     }
 }
