@@ -138,6 +138,7 @@ struct ContentView: View {
     @State private var videoPermissionPopoverItems: [VideoPermissionPopoverItem] = []
     @State private var videoPermissionPopoverFallbackMessage: String? = nil
     @State private var keyboardMonitor: Any? = nil
+    @State private var lightBox = LightBoxController()
     let timer = Timer.publish(every: 1, on: .main, in: .common).autoconnect()
     let entryHeight: CGFloat = 40
     
@@ -1702,6 +1703,7 @@ struct ContentView: View {
             showingSidebar = false  // Hide sidebar by default
             loadExistingEntries()
             installKeyboardShortcuts()
+            lightBox.start()
         }
         .onDisappear {
             if let keyboardMonitor {
@@ -2272,6 +2274,112 @@ struct ContentView: View {
         pdfContext.closePDF()
         
         return pdfData as Data
+    }
+}
+
+// Light box: a full-screen backdrop window that sits just behind the main
+// window and blurs + dims everything behind it. Shown only while the main
+// window is windowed (never in fullscreen) and the app is active.
+final class LightBoxController {
+    private var backdropWindow: NSWindow?
+    private weak var mainWindow: NSWindow?
+    private var observers: [NSObjectProtocol] = []
+    private var isRunning = false
+
+    private let dimAlpha: CGFloat = 0.22
+
+    func start() {
+        guard !isRunning else { return }
+        guard let window = NSApp.windows.first else { return }
+        isRunning = true
+        mainWindow = window
+        backdropWindow = makeBackdropWindow(for: window)
+        installObservers()
+        update()
+    }
+
+    func stop() {
+        observers.forEach { NotificationCenter.default.removeObserver($0) }
+        observers.removeAll()
+        backdropWindow?.orderOut(nil)
+        backdropWindow?.close()
+        backdropWindow = nil
+        isRunning = false
+    }
+
+    private func makeBackdropWindow(for main: NSWindow) -> NSWindow {
+        let frame = main.screen?.frame ?? NSScreen.main?.frame ?? .zero
+        let window = NSWindow(
+            contentRect: frame,
+            styleMask: [.borderless],
+            backing: .buffered,
+            defer: false
+        )
+        window.isOpaque = false
+        window.backgroundColor = .clear
+        window.hasShadow = false
+        window.ignoresMouseEvents = true
+        window.isReleasedWhenClosed = false
+        window.level = .normal
+        window.collectionBehavior = [.stationary, .ignoresCycle, .fullScreenAuxiliary]
+
+        let effect = NSVisualEffectView(frame: NSRect(origin: .zero, size: frame.size))
+        effect.autoresizingMask = [.width, .height]
+        effect.material = .fullScreenUI
+        effect.blendingMode = .behindWindow
+        effect.state = .active
+        window.contentView = effect
+
+        let dim = NSView(frame: effect.bounds)
+        dim.autoresizingMask = [.width, .height]
+        dim.wantsLayer = true
+        dim.layer?.backgroundColor = NSColor.black.withAlphaComponent(dimAlpha).cgColor
+        effect.addSubview(dim)
+
+        return window
+    }
+
+    private func installObservers() {
+        let center = NotificationCenter.default
+        let main = mainWindow
+
+        observers.append(center.addObserver(forName: NSApplication.didBecomeActiveNotification, object: nil, queue: .main) { [weak self] _ in
+            self?.update()
+        })
+        observers.append(center.addObserver(forName: NSApplication.didResignActiveNotification, object: nil, queue: .main) { [weak self] _ in
+            self?.update()
+        })
+
+        let windowNotifications: [Notification.Name] = [
+            NSWindow.didEnterFullScreenNotification,
+            NSWindow.didExitFullScreenNotification,
+            NSWindow.didMiniaturizeNotification,
+            NSWindow.didDeminiaturizeNotification,
+            NSWindow.didChangeScreenNotification,
+            NSWindow.didBecomeKeyNotification
+        ]
+        for name in windowNotifications {
+            observers.append(center.addObserver(forName: name, object: main, queue: .main) { [weak self] _ in
+                self?.update()
+            })
+        }
+    }
+
+    private func update() {
+        guard let backdrop = backdropWindow, let main = mainWindow else { return }
+
+        let isFullScreen = main.styleMask.contains(.fullScreen)
+        let shouldShow = NSApp.isActive && main.isVisible && !main.isMiniaturized && !isFullScreen
+
+        if shouldShow {
+            let frame = main.screen?.frame ?? NSScreen.main?.frame ?? .zero
+            if backdrop.frame != frame {
+                backdrop.setFrame(frame, display: true)
+            }
+            backdrop.order(.below, relativeTo: main.windowNumber)
+        } else {
+            backdrop.orderOut(nil)
+        }
     }
 }
 
