@@ -148,8 +148,8 @@ struct ContentView: View {
     @State private var ghostEngine = GhostEngineBox()
     @State private var editorAlignment: EditorAlignment = .center
     @State private var caretRect: CGRect = .zero
+    @State private var ghostThinking = false
     @State private var isHoveringAlignment = false
-    @StateObject private var muse = MuseChatModel()
     let timer = Timer.publish(every: 1, on: .main, in: .common).autoconnect()
     let entryHeight: CGFloat = 40
     
@@ -915,14 +915,16 @@ struct ContentView: View {
                         engine: ghostEngine,
                         centerContent: editorAlignment == .center,
                         caretRect: $caretRect,
-                        onGhostClicked: { openMuse() }
+                        thinking: $ghostThinking
                     )
                     .background(Color(colorScheme == .light ? .white : .black))
                     .frame(maxWidth: 650)
                     .overlay(alignment: .topLeading) {
-                        if muse.isOpen {
-                            InlineChatPanel(model: muse, isDark: colorScheme == .dark)
-                                .offset(x: musePanelX, y: musePanelY)
+                        if ghostThinking {
+                            ProgressView()
+                                .controlSize(.small)
+                                .offset(x: max(0, caretRect.maxX + 6), y: max(0, caretRect.minY - 2))
+                                .allowsHitTesting(false)
                                 .transition(.opacity)
                         }
                     }
@@ -1964,13 +1966,7 @@ struct ContentView: View {
         case "g":
             guard ghostEngine.isAvailable else { return nil }
             ghostArmed.toggle()
-            return nil
-        case "j":
-            if muse.isOpen {
-                muse.close()
-            } else {
-                openMuse()
-            }
+            if !ghostArmed { ghostThinking = false }
             return nil
         default:
             return event
@@ -1992,27 +1988,6 @@ struct ContentView: View {
             selectedFont = randomFont
             currentRandomFont = randomFont
         }
-    }
-
-    private var musePanelX: CGFloat {
-        let width: CGFloat = 320
-        let maxX = max(0, 650 - width)
-        if caretRect == .zero { return maxX }
-        return min(max(caretRect.minX, 0), maxX)
-    }
-
-    private var musePanelY: CGFloat {
-        if caretRect == .zero { return 160 }
-        return caretRect.maxY + 8
-    }
-
-    private func openMuse() {
-        guard muse.engineAvailable else { return }
-        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return }
-        ghostEngine.cancel()
-        ghostArmed = false
-        muse.open(context: trimmed)
     }
 
     private func openChatGPT() {
@@ -2364,92 +2339,108 @@ struct ContentView: View {
     }
 }
 
-// MARK: - Ghost writing (on-device Apple Intelligence)
+// MARK: - Ghost companion (on-device Apple Intelligence)
 
-/// Type-erased wrapper so the rest of the app doesn't need availability checks.
+/// Type-erased wrapper so ContentView doesn't need availability checks.
 final class GhostEngineBox {
     let isAvailable: Bool
-    private let suggestImpl: (String, @escaping (String) -> Void, @escaping () -> Void) -> Void
+    private let respondImpl: (String, String, @escaping (String) -> Void, @escaping () -> Void) -> Void
     private let cancelImpl: () -> Void
+    private let resetImpl: () -> Void
 
     init() {
         if #available(macOS 26.0, *) {
             let engine = GhostEngine()
             isAvailable = engine.isAvailable
-            suggestImpl = { context, onUpdate, onDone in
-                engine.suggest(context: context, onUpdate: onUpdate, onDone: onDone)
+            respondImpl = { context, prompt, onUpdate, onDone in
+                engine.respond(context: context, prompt: prompt, onUpdate: onUpdate, onDone: onDone)
             }
             cancelImpl = { engine.cancel() }
+            resetImpl = { engine.reset() }
         } else {
             isAvailable = false
-            suggestImpl = { _, _, onDone in onDone() }
+            respondImpl = { _, _, _, onDone in onDone() }
             cancelImpl = {}
+            resetImpl = {}
         }
     }
 
-    func suggest(context: String, onUpdate: @escaping (String) -> Void, onDone: @escaping () -> Void) {
-        suggestImpl(context, onUpdate, onDone)
+    func respond(context: String, prompt: String, onUpdate: @escaping (String) -> Void, onDone: @escaping () -> Void) {
+        respondImpl(context, prompt, onUpdate, onDone)
     }
 
     func cancel() { cancelImpl() }
+    func reset() { resetImpl() }
 }
 
-/// Streams short continuations from the on-device Apple Foundation Model.
+/// Streams short, supportive notes from the on-device Apple Foundation Model.
 @available(macOS 26.0, *)
 final class GhostEngine {
     private var task: Task<Void, Never>?
+    private var session: LanguageModelSession?
 
     static let instructions = """
-    You are a quiet, invisible writing companion inside a freewriting app. \
-    The writer shares the text they have written so far. Continue it with the next few words \
-    they would most plausibly write next, in their own voice and rhythm. \
-    Output ONLY the continuation: never repeat or restate their text, no quotation marks, \
-    no labels, no explanation. Keep it under 10 words.
+    You are a quiet, warm writing companion inside a freewriting app. \
+    You read what someone freewrote and give ONE short, supportive thought: \
+    a small idea, a gentle nudge, or a question — never a lecture. \
+    Keep it to a single short sentence, under 14 words. \
+    No headings, no lists, never quote their text back, no therapy-speak.
     """
 
-    var isAvailable: Bool {
-        SystemLanguageModel.default.isAvailable
-    }
+    var isAvailable: Bool { SystemLanguageModel.default.isAvailable }
 
     func cancel() {
         task?.cancel()
         task = nil
     }
 
-    func suggest(context: String, onUpdate: @escaping (String) -> Void, onDone: @escaping () -> Void) {
+    func reset() {
+        cancel()
+        session = nil
+    }
+
+    func respond(context: String, prompt: String, onUpdate: @escaping (String) -> Void, onDone: @escaping () -> Void) {
         cancel()
         guard case .available = SystemLanguageModel.default.availability else {
             onDone()
             return
         }
-        let instructions = GhostEngine.instructions
+        let session: LanguageModelSession
+        if let existing = self.session {
+            session = existing
+        } else {
+            session = LanguageModelSession(instructions: GhostEngine.instructions)
+            self.session = session
+        }
+        let fullPrompt = context.isEmpty ? prompt : "My writing so far:\n\n\(context)\n\n\(prompt)"
         task = Task {
-            let session = LanguageModelSession(instructions: instructions)
             do {
-                let stream = session.streamResponse(to: context)
+                let stream = session.streamResponse(to: fullPrompt)
                 for try await partial in stream {
                     if Task.isCancelled { return }
                     let text = partial.content
                     await MainActor.run { onUpdate(text) }
                 }
             } catch {
-                // Ghost simply doesn't appear on failure.
+                await MainActor.run { self.session = nil }
             }
             await MainActor.run { onDone() }
         }
     }
 }
 
-/// NSTextView subclass that hands Tab / Escape / clicks to the coordinator first.
+/// NSTextView subclass that hands Tab / Escape / Enter / clicks to the coordinator first.
 final class GhostNSTextView: NSTextView {
     var onTab: (() -> Bool)?
     var onEscape: (() -> Bool)?
+    var onEnter: (() -> Bool)?
     var onMouseDown: ((NSEvent) -> Bool)?
 
     override func keyDown(with event: NSEvent) {
         let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
-        if event.keyCode == 48, flags.isEmpty, let onTab, onTab() { return }        // Tab
+        if event.keyCode == 48, flags.isEmpty, let onTab, onTab() { return }          // Tab
         if event.keyCode == 53, let onEscape, onEscape() { return }                    // Escape
+        if (event.keyCode == 36 || event.keyCode == 76), flags.isEmpty, let onEnter, onEnter() { return } // Return
         super.keyDown(with: event)
     }
 
@@ -2459,8 +2450,9 @@ final class GhostNSTextView: NSTextView {
     }
 }
 
-/// A minimal NSTextView-backed editor that renders on-device "ghost" suggestions
-/// after the caret: dimmed, in the selected font/size, never stealing the caret.
+/// A minimal NSTextView-backed editor that renders the companion's notes inline
+/// as dimmed "ghost" text past the caret. Typing a question after a note and
+/// pressing Return continues the conversation; answers stream back in as ghost.
 struct GhostTextView: NSViewRepresentable {
     @Binding var text: String
     let fontName: String
@@ -2471,7 +2463,7 @@ struct GhostTextView: NSViewRepresentable {
     let engine: GhostEngineBox
     let centerContent: Bool
     @Binding var caretRect: CGRect
-    let onGhostClicked: () -> Void
+    @Binding var thinking: Bool
 
     func makeCoordinator() -> Coordinator { Coordinator(self) }
 
@@ -2519,11 +2511,14 @@ struct GhostTextView: NSViewRepresentable {
         textView.onEscape = { [weak coordinator = context.coordinator] in
             coordinator?.escapePressed() ?? false
         }
+        textView.onEnter = { [weak coordinator = context.coordinator] in
+            coordinator?.enterPressed() ?? false
+        }
         textView.onMouseDown = { [weak coordinator = context.coordinator] event in
             coordinator?.handleMouseDown(event) ?? false
         }
 
-        context.coordinator.installObservers(initialText: text)
+        context.coordinator.installObservers()
 
         DispatchQueue.main.async {
             textView.window?.makeFirstResponder(textView)
@@ -2541,19 +2536,23 @@ struct GhostTextView: NSViewRepresentable {
     }
 
     final class Coordinator: NSObject, NSTextViewDelegate {
+        enum Phase { case off, idle, note, thinking }
+
         var parent: GhostTextView
         weak var textView: GhostNSTextView?
         var originalInsertionPointColor: NSColor = .black
 
         private let ghostKey = NSAttributedString.Key("freewrite.ghost")
+        private let hintText = "\n\n↵  ask about this…"
         private var ghostRange: NSRange?
-        private var ghostAnchor: Int = 0
+        private var ghostInsertAt: Int = 0
+        private var turnAnchor: Int = 0
+        private var phase: Phase = .off
         private var pauseToken = 0
         private var isManipulatingGhost = false
         private var lastReportedText = ""
         private var lastStyleKey = ""
         private var lastArmed = false
-        private var isGenerating = false
         private var observers: [NSObjectProtocol] = []
         private var lastCenter = false
 
@@ -2561,10 +2560,20 @@ struct GhostTextView: NSViewRepresentable {
             self.parent = parent
         }
 
-        func installObservers(initialText: String) {
-            lastCenter = parent.centerContent
+        func onSetup(initialText: String) {
+            guard let tv = textView else { return }
+            isManipulatingGhost = true
+            tv.string = initialText
+            isManipulatingGhost = false
+            lastReportedText = initialText
+            lastStyleKey = ""
             applyStyle()
             applyCaret()
+            tv.setSelectedRange(NSRange(location: (initialText as NSString).length, length: 0))
+        }
+
+        func installObservers() {
+            lastCenter = parent.centerContent
             if let tv = textView, let scroll = tv.enclosingScrollView {
                 scroll.contentView.postsBoundsChangedNotifications = true
                 let center = NotificationCenter.default
@@ -2586,12 +2595,280 @@ struct GhostTextView: NSViewRepresentable {
             observers.removeAll()
         }
 
+        func refresh() {
+            guard textView != nil else { return }
+            let styleKey = "\(parent.fontName)|\(parent.fontSize)|\(parent.isDark)|\(parent.lineSpacing)"
+            if styleKey != lastStyleKey {
+                applyStyle()
+            }
+            if parent.text != lastReportedText {
+                setExternalText(parent.text)
+            }
+            if parent.armed, !lastArmed {
+                parent.engine.reset()
+                setPhase(.idle)
+                scheduleSuggestion()
+            }
+            if !parent.armed, lastArmed {
+                parent.engine.cancel()
+                clearGhost()
+                setPhase(.off)
+            }
+            lastArmed = parent.armed
+            if parent.centerContent != lastCenter {
+                lastCenter = parent.centerContent
+                recomputeInsets()
+            }
+            applyCaret()
+            updateCaretRect()
+        }
+
+        // MARK: NSTextViewDelegate
+
+        func textDidChange(_ notification: Notification) {
+            guard !isManipulatingGhost, let tv = textView else { return }
+            let real = tv.string
+            lastReportedText = real
+            parent.text = real
+            recomputeInsets()
+            updateCaretRect()
+            if phase == .idle {
+                scheduleSuggestion()
+            }
+        }
+
+        func textView(_ textView: NSTextView, shouldChangeTextIn affectedCharRange: NSRange, replacementString: String?) -> Bool {
+            if let gr = ghostRange {
+                if phase == .note {
+                    let ghostEnd = gr.location + gr.length
+                    if affectedCharRange.location >= ghostEnd {
+                        return true  // typing the reply — keep the note visible
+                    }
+                }
+                clearGhost()
+                setPhase(.idle)
+            }
+            return true
+        }
+
         func textViewDidChangeSelection(_ notification: Notification) {
             updateCaretRect()
         }
 
-        /// Keeps the caret rect (in the editor's coordinate space) up to date for
-        /// anchoring the inline chat, and paints the vertical alignment inset.
+        // MARK: Key actions
+
+        func enterPressed() -> Bool {
+            guard phase == .note, let tv = textView, let gr = ghostRange else { return false }
+            let ns = tv.string as NSString
+            let ghostEnd = gr.location + gr.length
+            guard ns.length > ghostEnd else { return false }  // nothing typed → normal newline
+
+            let replyRange = NSRange(location: ghostEnd, length: ns.length - ghostEnd)
+            let question = ns.substring(with: replyRange).trimmingCharacters(in: .whitespacesAndNewlines)
+
+            isManipulatingGhost = true
+            tv.textStorage?.replaceCharacters(in: replyRange, with: "")
+            if let g = ghostRange {
+                tv.textStorage?.replaceCharacters(in: g, with: "")
+                ghostRange = nil
+            }
+            isManipulatingGhost = false
+
+            let real = tv.string
+            lastReportedText = real
+            parent.text = real
+            let anchor = min(turnAnchor, (real as NSString).length)
+            tv.setSelectedRange(NSRange(location: anchor, length: 0))
+
+            if question.isEmpty {
+                setPhase(.idle)
+                return true
+            }
+            requestAnswer(question: question)
+            return true
+        }
+
+        func acceptGhost() -> Bool {
+            guard let tv = textView, var range = ghostRange else { return false }
+            // Drop the trailing hint before promoting the note into real text.
+            if phase == .note {
+                let hintLen = (hintText as NSString).length
+                if range.length > hintLen {
+                    let tailRange = NSRange(location: range.location + range.length - hintLen, length: hintLen)
+                    if (tv.string as NSString).substring(with: tailRange) == hintText {
+                        isManipulatingGhost = true
+                        tv.textStorage?.replaceCharacters(in: tailRange, with: "")
+                        isManipulatingGhost = false
+                        range = NSRange(location: range.location, length: range.length - hintLen)
+                    }
+                }
+            }
+            isManipulatingGhost = true
+            tv.textStorage?.removeAttribute(ghostKey, range: range)
+            isManipulatingGhost = false
+            ghostRange = nil
+            let end = range.location + range.length
+            tv.setSelectedRange(NSRange(location: end, length: 0))
+            let real = tv.string
+            lastReportedText = real
+            parent.text = real
+            parent.engine.cancel()
+            setPhase(.idle)
+            return true
+        }
+
+        func escapePressed() -> Bool {
+            let hadGhost = ghostRange != nil
+            let wasThinking = phase == .thinking
+            parent.engine.cancel()
+            clearGhost()
+            if parent.armed {
+                parent.armed = false
+            }
+            setPhase(.off)
+            return hadGhost || wasThinking
+        }
+
+        func handleMouseDown(_ event: NSEvent) -> Bool {
+            if ghostRange != nil {
+                clearGhost()
+                if phase == .note { setPhase(.idle) }
+            }
+            return false
+        }
+
+        // MARK: Companion lifecycle
+
+        private func scheduleSuggestion() {
+            guard parent.armed, parent.engine.isAvailable, phase == .idle else { return }
+            pauseToken += 1
+            let token = pauseToken
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.9) { [weak self] in
+                guard let self, token == self.pauseToken, self.parent.armed, self.phase == .idle else { return }
+                self.requestNote()
+            }
+        }
+
+        private func requestNote() {
+            guard parent.armed, parent.engine.isAvailable, let tv = textView else { return }
+            let ns = tv.string as NSString
+            guard tv.selectedRange().length == 0 else { return }
+            let caret = min(tv.selectedRange().location, ns.length)
+            let context = buildContext(ns.substring(to: caret))
+            guard !context.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
+
+            ghostInsertAt = caret
+            turnAnchor = caret
+            setPhase(.thinking)
+            parent.engine.respond(
+                context: context,
+                prompt: "Give me one short, supportive thought about where this is heading.",
+                onUpdate: { [weak self] partial in
+                    self?.streamGhost(partial)
+                },
+                onDone: { [weak self] in
+                    self?.finishNote()
+                }
+            )
+        }
+
+        private func requestAnswer(question: String) {
+            setPhase(.thinking)
+            parent.engine.respond(
+                context: "",
+                prompt: question,
+                onUpdate: { [weak self] partial in
+                    self?.streamGhost(partial)
+                },
+                onDone: { [weak self] in
+                    self?.finishNote()
+                }
+            )
+        }
+
+        private func streamGhost(_ partial: String) {
+            guard let tv = textView else { return }
+            guard parent.armed, phase == .thinking else {
+                parent.engine.cancel()
+                return
+            }
+            if ghostRange == nil {
+                // First token: anchor the note where the caret is right now.
+                let caret = min(tv.selectedRange().location, (tv.string as NSString).length)
+                ghostInsertAt = caret
+                turnAnchor = caret
+            }
+            showGhost(partial, hint: false)
+        }
+
+        private func finishNote() {
+            guard parent.armed else {
+                parent.engine.cancel()
+                setPhase(.idle)
+                return
+            }
+            guard ghostRange != nil else {
+                setPhase(.idle)
+                return
+            }
+            appendHint()
+            setPhase(.note)
+            focusGhostEnd()
+        }
+
+        // MARK: Ghost rendering
+
+        private func showGhost(_ raw: String, hint: Bool) {
+            guard let tv = textView else { return }
+            let cleaned = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+            isManipulatingGhost = true
+            if let gr = ghostRange {
+                tv.textStorage?.replaceCharacters(in: gr, with: "")
+                ghostRange = nil
+            }
+            if !cleaned.isEmpty {
+                let length = (tv.string as NSString).length
+                let insertAt = min(ghostInsertAt, length)
+                var string = " " + cleaned
+                if hint { string += hintText }
+                let attributed = NSAttributedString(string: string, attributes: ghostAttributes())
+                tv.textStorage?.replaceCharacters(in: NSRange(location: insertAt, length: 0), with: attributed)
+                ghostRange = NSRange(location: insertAt, length: attributed.length)
+            }
+            isManipulatingGhost = false
+        }
+
+        private func appendHint() {
+            guard let tv = textView, let gr = ghostRange else { return }
+            let hint = NSAttributedString(string: hintText, attributes: ghostAttributes())
+            isManipulatingGhost = true
+            tv.textStorage?.replaceCharacters(in: NSRange(location: gr.location + gr.length, length: 0), with: hint)
+            ghostRange = NSRange(location: gr.location, length: gr.length + hint.length)
+            isManipulatingGhost = false
+        }
+
+        private func clearGhost() {
+            guard let tv = textView, let gr = ghostRange else { return }
+            isManipulatingGhost = true
+            tv.textStorage?.replaceCharacters(in: gr, with: "")
+            isManipulatingGhost = false
+            ghostRange = nil
+            let length = (tv.string as NSString).length
+            if tv.selectedRange().location > length {
+                tv.setSelectedRange(NSRange(location: length, length: 0))
+            }
+        }
+
+        private func focusGhostEnd() {
+            guard let tv = textView, let gr = ghostRange else { return }
+            let end = gr.location + gr.length
+            if tv.selectedRange().location <= end {
+                tv.setSelectedRange(NSRange(location: end, length: 0))
+            }
+        }
+
+        // MARK: Geometry
+
         private func recomputeInsets() {
             guard let tv = textView, let scroll = tv.enclosingScrollView,
                   let lm = tv.layoutManager, let tc = tv.textContainer else { return }
@@ -2624,203 +2901,13 @@ struct GhostTextView: NSViewRepresentable {
             parent.caretRect = visible
         }
 
-        func handleMouseDown(_ event: NSEvent) -> Bool {
-            guard let tv = textView, let gr = ghostRange else { return false }
-            let point = tv.convert(event.locationInWindow, from: nil)
-            let index = tv.characterIndexForInsertion(at: point)
-            if NSLocationInRange(index, gr) {
-                parent.onGhostClicked()
-                return true
-            }
-            clearGhostForClick()
-            return false
-        }
-
-        func onSetup(initialText: String) {
-            guard let tv = textView else { return }
-            isManipulatingGhost = true
-            tv.string = initialText
-            isManipulatingGhost = false
-            lastReportedText = initialText
-            lastStyleKey = ""
-            applyStyle()
-            applyCaret()
-            tv.setSelectedRange(NSRange(location: (initialText as NSString).length, length: 0))
-        }
-
-        func refresh() {
-            guard textView != nil else { return }
-            let styleKey = "\(parent.fontName)|\(parent.fontSize)|\(parent.isDark)|\(parent.lineSpacing)"
-            if styleKey != lastStyleKey {
-                applyStyle()
-            }
-            if parent.text != lastReportedText {
-                setExternalText(parent.text)
-            }
-            if parent.armed, !lastArmed {
-                scheduleSuggestion()
-            }
-            if !parent.armed, lastArmed {
-                parent.engine.cancel()
-                removeGhost()
-                isGenerating = false
-            }
-            lastArmed = parent.armed
-            if parent.centerContent != lastCenter {
-                lastCenter = parent.centerContent
-                recomputeInsets()
-            }
-            applyCaret()
-            updateCaretRect()
-        }
-
-        // MARK: NSTextViewDelegate
-
-        func textDidChange(_ notification: Notification) {
-            guard !isManipulatingGhost, let tv = textView else { return }
-            if ghostRange != nil { removeGhost() }
-            let real = tv.string
-            lastReportedText = real
-            parent.text = real
-            recomputeInsets()
-            updateCaretRect()
-            scheduleSuggestion()
-        }
-
-        func textView(_ textView: NSTextView, shouldChangeTextIn affectedCharRange: NSRange, replacementString: String?) -> Bool {
-            if ghostRange != nil {
-                parent.engine.cancel()
-                isGenerating = false
-                removeGhost()
-            }
-            return true
-        }
-
-        // MARK: Ghost lifecycle
-
-        private func scheduleSuggestion() {
-            guard parent.armed, parent.engine.isAvailable else { return }
-            pauseToken += 1
-            let token = pauseToken
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) { [weak self] in
-                guard let self, token == self.pauseToken, self.parent.armed else { return }
-                self.requestGhost()
-            }
-        }
-
-        private func requestGhost() {
-            guard parent.armed, parent.engine.isAvailable, let tv = textView else { return }
-            let ns = tv.string as NSString
-            guard tv.selectedRange().length == 0 else { return }
-            let caret = min(tv.selectedRange().location, ns.length)
-            let context = buildContext(ns.substring(to: caret))
-            guard !context.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
-
-            ghostAnchor = caret
-            isGenerating = true
-            applyCaret()
-
-            parent.engine.suggest(context: context, onUpdate: { [weak self] partial in
-                guard let self, let tv = self.textView else { return }
-                guard self.parent.armed else {
-                    self.parent.engine.cancel()
-                    return
-                }
-                guard tv.selectedRange().length == 0, tv.selectedRange().location == self.ghostAnchor else {
-                    self.parent.engine.cancel()
-                    return
-                }
-                self.renderGhost(partial)
-            }, onDone: { [weak self] in
-                guard let self else { return }
-                self.isGenerating = false
-                self.applyCaret()
-            })
-        }
-
-        private func renderGhost(_ raw: String) {
-            guard let tv = textView else { return }
-            let cleaned = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-            isManipulatingGhost = true
-            if let gr = ghostRange {
-                tv.textStorage?.replaceCharacters(in: gr, with: "")
-                ghostRange = nil
-            }
-            if !cleaned.isEmpty {
-                let length = (tv.string as NSString).length
-                let insertAt = min(ghostAnchor, length)
-                let attributed = NSAttributedString(string: " " + cleaned, attributes: ghostAttributes())
-                tv.textStorage?.replaceCharacters(in: NSRange(location: insertAt, length: 0), with: attributed)
-                ghostRange = NSRange(location: insertAt, length: attributed.length)
-                tv.setSelectedRange(NSRange(location: insertAt, length: 0))
-            }
-            isManipulatingGhost = false
-        }
-
-        private func removeGhost() {
-            guard let tv = textView, let gr = ghostRange else { return }
-            isManipulatingGhost = true
-            tv.textStorage?.replaceCharacters(in: gr, with: "")
-            isManipulatingGhost = false
-            ghostRange = nil
-            let length = (tv.string as NSString).length
-            if tv.selectedRange().location > length {
-                tv.setSelectedRange(NSRange(location: length, length: 0))
-            }
-        }
-
-        func acceptGhost() -> Bool {
-            guard let tv = textView, let gr = ghostRange else { return false }
-            isManipulatingGhost = true
-            tv.textStorage?.removeAttribute(ghostKey, range: gr)
-            isManipulatingGhost = false
-            ghostRange = nil
-            let end = gr.location + gr.length
-            tv.setSelectedRange(NSRange(location: end, length: 0))
-            let real = tv.string
-            lastReportedText = real
-            parent.text = real
-            parent.engine.cancel()
-            isGenerating = false
-            applyCaret()
-            return true
-        }
-
-        func escapePressed() -> Bool {
-            let hadGhost = ghostRange != nil
-            parent.engine.cancel()
-            removeGhost()
-            isGenerating = false
-            applyCaret()
-            if parent.armed {
-                parent.armed = false
-                return true
-            }
-            return hadGhost
-        }
-
-        func clearGhostForClick() {
-            guard ghostRange != nil else { return }
-            parent.engine.cancel()
-            removeGhost()
-            isGenerating = false
-            applyCaret()
-        }
-
-        private func setExternalText(_ newText: String) {
-            guard let tv = textView else { return }
-            removeGhost()
-            isManipulatingGhost = true
-            tv.string = newText
-            isManipulatingGhost = false
-            lastReportedText = newText
-            lastStyleKey = ""
-            applyStyle()
-            applyCaret()
-            tv.setSelectedRange(NSRange(location: (newText as NSString).length, length: 0))
-        }
-
         // MARK: Styling
+
+        private func setPhase(_ newPhase: Phase) {
+            phase = newPhase
+            parent.thinking = (newPhase == .thinking)
+            applyCaret()
+        }
 
         private func baseAttributes() -> [NSAttributedString.Key: Any] {
             let font = NSFont(name: parent.fontName, size: parent.fontSize) ?? .systemFont(ofSize: parent.fontSize)
@@ -2841,7 +2928,7 @@ struct GhostTextView: NSViewRepresentable {
 
         private func applyStyle() {
             guard let tv = textView else { return }
-            removeGhost()
+            clearGhost()
             isManipulatingGhost = true
             let attrs = baseAttributes()
             tv.font = (attrs[.font] as? NSFont) ?? .systemFont(ofSize: parent.fontSize)
@@ -2854,7 +2941,7 @@ struct GhostTextView: NSViewRepresentable {
 
         private func applyCaret() {
             guard let tv = textView else { return }
-            if isGenerating {
+            if phase == .thinking {
                 tv.insertionPointColor = .systemPink
             } else if parent.armed {
                 tv.insertionPointColor = .systemPurple
@@ -2863,231 +2950,24 @@ struct GhostTextView: NSViewRepresentable {
             }
         }
 
+        private func setExternalText(_ newText: String) {
+            guard let tv = textView else { return }
+            clearGhost()
+            isManipulatingGhost = true
+            tv.string = newText
+            isManipulatingGhost = false
+            lastReportedText = newText
+            lastStyleKey = ""
+            applyStyle()
+            setPhase(.off)
+            applyCaret()
+            tv.setSelectedRange(NSRange(location: (newText as NSString).length, length: 0))
+        }
+
         private func buildContext(_ text: String) -> String {
             let limit = 8000
-            let clipped = text.count <= limit ? text : String(text.suffix(limit))
-            return "My writing so far:\n\n\(clipped)\n\nContinue from exactly where this leaves off."
+            return text.count <= limit ? text : String(text.suffix(limit))
         }
-    }
-}
-
-// MARK: - Inline ghost chat ("Muse", on-device Apple Intelligence)
-
-struct MuseTurn: Identifiable {
-    enum Role { case user, assistant }
-    let id = UUID()
-    let role: Role
-    let text: String
-}
-
-/// Type-erased wrapper so ContentView doesn't need availability checks.
-final class MuseEngineBox {
-    let isAvailable: Bool
-    private let sendImpl: (String, String?, @escaping (String) -> Void, @escaping () -> Void) -> Void
-    private let cancelImpl: () -> Void
-
-    init() {
-        if #available(macOS 26.0, *) {
-            let engine = MuseEngine()
-            isAvailable = engine.isAvailable
-            sendImpl = { prompt, context, onUpdate, onDone in
-                engine.send(prompt: prompt, context: context, onUpdate: onUpdate, onDone: onDone)
-            }
-            cancelImpl = { engine.cancel() }
-        } else {
-            isAvailable = false
-            sendImpl = { _, _, _, onDone in onDone() }
-            cancelImpl = {}
-        }
-    }
-
-    func send(prompt: String, context: String?, onUpdate: @escaping (String) -> Void, onDone: @escaping () -> Void) {
-        sendImpl(prompt, context, onUpdate, onDone)
-    }
-
-    func cancel() { cancelImpl() }
-}
-
-@available(macOS 26.0, *)
-final class MuseEngine {
-    private var task: Task<Void, Never>?
-    private var session: LanguageModelSession?
-
-    static let instructions = """
-    You are a warm, perceptive writing companion inside a minimal freewriting app. \
-    You read what someone freewrote and respond like an old friend — casual and human, never clinical. \
-    Help them see connections they might miss, comfort, and gently challenge. \
-    Keep it short: a few sentences, no headings, no lists, no therapy-speak.
-    """
-
-    var isAvailable: Bool { SystemLanguageModel.default.isAvailable }
-
-    func cancel() {
-        task?.cancel()
-        task = nil
-    }
-
-    func send(prompt: String, context: String?, onUpdate: @escaping (String) -> Void, onDone: @escaping () -> Void) {
-        cancel()
-        guard case .available = SystemLanguageModel.default.availability else {
-            onDone()
-            return
-        }
-        let session: LanguageModelSession
-        if let existing = self.session {
-            session = existing
-        } else {
-            session = LanguageModelSession(instructions: MuseEngine.instructions)
-            self.session = session
-        }
-        let fullPrompt: String
-        if let context {
-            fullPrompt = "Here is my freewriting so far:\n\n\(context)\n\n\(prompt)"
-        } else {
-            fullPrompt = prompt
-        }
-        task = Task {
-            do {
-                let stream = session.streamResponse(to: fullPrompt)
-                for try await partial in stream {
-                    if Task.isCancelled { return }
-                    let text = partial.content
-                    await MainActor.run { onUpdate(text) }
-                }
-            } catch {
-                await MainActor.run { self.session = nil }
-            }
-            await MainActor.run { onDone() }
-        }
-    }
-}
-
-final class MuseChatModel: ObservableObject {
-    @Published var isOpen = false
-    @Published var input = ""
-    @Published var turns: [MuseTurn] = []
-    @Published var streamingText = ""
-    @Published var isThinking = false
-
-    let engineAvailable: Bool
-    private let engine = MuseEngineBox()
-
-    init() {
-        engineAvailable = engine.isAvailable
-    }
-
-    func open(context: String) {
-        isOpen = true
-        turns = []
-        streamingText = ""
-        input = ""
-        request(
-            prompt: "Reflect on what I've written so far — a short, warm note — then ask me one question.",
-            context: context
-        )
-    }
-
-    func send() {
-        let message = input.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !message.isEmpty else { return }
-        input = ""
-        turns.append(MuseTurn(role: .user, text: message))
-        request(prompt: message, context: nil)
-    }
-
-    func close() {
-        isOpen = false
-        engine.cancel()
-        streamingText = ""
-        isThinking = false
-    }
-
-    private func request(prompt: String, context: String?) {
-        isThinking = true
-        streamingText = ""
-        engine.send(prompt: prompt, context: context, onUpdate: { [weak self] partial in
-            self?.streamingText = partial
-        }, onDone: { [weak self] in
-            guard let self else { return }
-            if !self.streamingText.isEmpty {
-                self.turns.append(MuseTurn(role: .assistant, text: self.streamingText))
-            }
-            self.streamingText = ""
-            self.isThinking = false
-        })
-    }
-}
-
-struct InlineChatPanel: View {
-    @ObservedObject var model: MuseChatModel
-    let isDark: Bool
-    @FocusState private var inputFocused: Bool
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            HStack {
-                Text("Muse")
-                    .font(.system(size: 11, weight: .semibold))
-                    .foregroundColor(.secondary)
-                Spacer()
-                Button(action: { model.close() }) {
-                    Image(systemName: "xmark")
-                        .font(.system(size: 10, weight: .semibold))
-                }
-                .buttonStyle(.plain)
-                .foregroundColor(.secondary)
-            }
-
-            ScrollView {
-                VStack(alignment: .leading, spacing: 8) {
-                    ForEach(model.turns) { turn in
-                        Text(turn.text)
-                            .font(.system(size: 13))
-                            .foregroundColor(turn.role == .user ? .secondary : .primary)
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                    }
-                    if !model.streamingText.isEmpty {
-                        Text(model.streamingText)
-                            .font(.system(size: 13))
-                            .foregroundColor(.primary)
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                    } else if model.isThinking {
-                        Text("…")
-                            .font(.system(size: 13))
-                            .foregroundColor(.secondary)
-                    }
-                }
-                .frame(maxWidth: .infinity, alignment: .leading)
-            }
-            .frame(maxHeight: 180)
-
-            HStack(spacing: 8) {
-                TextField("Ask about this…", text: $model.input)
-                    .textFieldStyle(.plain)
-                    .font(.system(size: 13))
-                    .focused($inputFocused)
-                    .onSubmit { model.send() }
-                Button(action: { model.send() }) {
-                    Image(systemName: "arrow.up.circle.fill")
-                        .font(.system(size: 16))
-                }
-                .buttonStyle(.plain)
-                .foregroundColor(.accentColor)
-            }
-        }
-        .padding(12)
-        .frame(width: 320)
-        .background(
-            RoundedRectangle(cornerRadius: 12)
-                .fill(isDark ? Color(white: 0.12) : Color.white)
-                .shadow(color: .black.opacity(isDark ? 0.5 : 0.15), radius: 12, y: 4)
-        )
-        .overlay(
-            RoundedRectangle(cornerRadius: 12)
-                .stroke(Color.gray.opacity(0.18), lineWidth: 1)
-        )
-        .onExitCommand { model.close() }
-        .onAppear { inputFocused = true }
     }
 }
 
