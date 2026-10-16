@@ -1,0 +1,65 @@
+name: Build macOS app
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build:
+    runs-on: macos-15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Show toolchain
+        run: |
+          xcodebuild -version
+          swift --version || true
+
+      - name: Build (Release, unsigned)
+        run: |
+          set -o pipefail
+          xcodebuild \
+            -project freewrite.xcodeproj \
+            -scheme freewrite \
+            -configuration Release \
+            -derivedDataPath build \
+            CODE_SIGN_IDENTITY="-" \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGNING_ALLOWED=NO \
+            build
+
+      - name: Locate app
+        id: locate
+        run: |
+          APP_PATH="$(find build/Build/Products/Release -maxdepth 1 -name '*.app' | head -1)"
+          if [ -z "$APP_PATH" ]; then
+            echo "No .app produced" >&2
+            exit 1
+          fi
+          echo "app_path=$APP_PATH" >> "$GITHUB_OUTPUT"
+          echo "Found: $APP_PATH"
+
+      - name: Ad-hoc sign with entitlements
+        run: |
+          APP_PATH="${{ steps.locate.outputs.app_path }}"
+          codesign --force --deep --sign - \
+            --entitlements freewrite/freewrite.entitlements \
+            "$APP_PATH" || codesign --force --deep --sign - "$APP_PATH"
+          codesign --verify --verbose=2 "$APP_PATH" || true
+
+      - name: Zip the app
+        run: |
+          APP_PATH="${{ steps.locate.outputs.app_path }}"
+          mkdir -p artifact
+          ditto -c -k --sequesterRsrc --keepParent "$APP_PATH" artifact/freewrite-app.zip
+          ls -la artifact
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: freewrite-app
+          path: artifact/freewrite-app.zip
+          if-no-files-found: error
