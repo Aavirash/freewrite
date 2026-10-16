@@ -149,6 +149,7 @@ struct ContentView: View {
     @State private var editorAlignment: EditorAlignment = .center
     @State private var caretRect: CGRect = .zero
     @State private var ghostThinking = false
+    @State private var glowPulse = false
     @State private var isHoveringAlignment = false
     let timer = Timer.publish(every: 1, on: .main, in: .common).autoconnect()
     let entryHeight: CGFloat = 40
@@ -920,12 +921,26 @@ struct ContentView: View {
                     .background(Color(colorScheme == .light ? .white : .black))
                     .frame(maxWidth: 650)
                     .overlay(alignment: .topLeading) {
-                        if ghostThinking {
-                            ProgressView()
-                                .controlSize(.small)
-                                .offset(x: max(0, caretRect.maxX + 6), y: max(0, caretRect.minY - 2))
-                                .allowsHitTesting(false)
-                                .transition(.opacity)
+                        if ghostArmed, caretRect != .zero {
+                            ZStack(alignment: .topLeading) {
+                                RoundedRectangle(cornerRadius: 1)
+                                    .fill(Color.white)
+                                    .frame(width: 2, height: max(caretRect.height, 16))
+                                    .blur(radius: 3)
+                                    .shadow(color: .black.opacity(0.3), radius: 1.5)
+                                    .opacity(glowPulse ? 0.7 : 1.0)
+                                    .offset(x: caretRect.minX - 1, y: caretRect.minY)
+                                if ghostThinking {
+                                    GlowSpinner()
+                                        .offset(x: caretRect.minX + 5, y: caretRect.minY)
+                                }
+                            }
+                            .allowsHitTesting(false)
+                            .onAppear {
+                                withAnimation(.easeInOut(duration: 1.1).repeatForever(autoreverses: true)) {
+                                    glowPulse = true
+                                }
+                            }
                         }
                     }
                     .padding(.top, 40)
@@ -1925,9 +1940,13 @@ struct ContentView: View {
     }
 
     private func handleKeyEvent(_ event: NSEvent) -> NSEvent? {
-        // Backspace / forward-delete lock
-        if backspaceDisabled && (event.keyCode == 51 || event.keyCode == 117) {
-            return nil
+        // Backspace / forward-delete: dismiss the companion if armed, else honor the lock.
+        if event.keyCode == 51 || event.keyCode == 117 {
+            if ghostArmed {
+                ghostArmed = false
+                return nil
+            }
+            if backspaceDisabled { return nil }
         }
 
         // ` / ~ key toggles the theme
@@ -2434,6 +2453,7 @@ final class GhostNSTextView: NSTextView {
     var onTab: (() -> Bool)?
     var onEscape: (() -> Bool)?
     var onEnter: (() -> Bool)?
+    var onBackspace: (() -> Bool)?
     var onMouseDown: ((NSEvent) -> Bool)?
 
     override func keyDown(with event: NSEvent) {
@@ -2441,6 +2461,7 @@ final class GhostNSTextView: NSTextView {
         if event.keyCode == 48, flags.isEmpty, let onTab, onTab() { return }          // Tab
         if event.keyCode == 53, let onEscape, onEscape() { return }                    // Escape
         if (event.keyCode == 36 || event.keyCode == 76), flags.isEmpty, let onEnter, onEnter() { return } // Return
+        if event.keyCode == 51 || event.keyCode == 117, let onBackspace, onBackspace() { return } // Delete
         super.keyDown(with: event)
     }
 
@@ -2513,6 +2534,9 @@ struct GhostTextView: NSViewRepresentable {
         }
         textView.onEnter = { [weak coordinator = context.coordinator] in
             coordinator?.enterPressed() ?? false
+        }
+        textView.onBackspace = { [weak coordinator = context.coordinator] in
+            coordinator?.backspacePressed() ?? false
         }
         textView.onMouseDown = { [weak coordinator = context.coordinator] event in
             coordinator?.handleMouseDown(event) ?? false
@@ -2596,7 +2620,7 @@ struct GhostTextView: NSViewRepresentable {
         }
 
         func refresh() {
-            guard textView != nil else { return }
+            guard let tv = textView else { return }
             let styleKey = "\(parent.fontName)|\(parent.fontSize)|\(parent.isDark)|\(parent.lineSpacing)"
             if styleKey != lastStyleKey {
                 applyStyle()
@@ -2612,6 +2636,8 @@ struct GhostTextView: NSViewRepresentable {
             if !parent.armed, lastArmed {
                 parent.engine.cancel()
                 clearGhost()
+                let anchor = min(turnAnchor, (tv.string as NSString).length)
+                tv.setSelectedRange(NSRange(location: anchor, length: 0))
                 setPhase(.off)
             }
             lastArmed = parent.armed
@@ -2735,6 +2761,20 @@ struct GhostTextView: NSViewRepresentable {
                 if phase == .note { setPhase(.idle) }
             }
             return false
+        }
+
+        /// Backspace dismisses the suggestion and stops the companion (until ⌘G
+        /// again) — unless the writer is mid-question after the note.
+        func backspacePressed() -> Bool {
+            guard let tv = textView, let gr = ghostRange else { return false }
+            let ns = tv.string as NSString
+            let ghostEnd = gr.location + gr.length
+            let caret = tv.selectedRange().location
+            if ns.length > ghostEnd, caret > ghostEnd {
+                return false  // editing the inline question — let backspace work
+            }
+            parent.armed = false
+            return true
         }
 
         // MARK: Companion lifecycle
@@ -2885,7 +2925,8 @@ struct GhostTextView: NSViewRepresentable {
         }
 
         private func updateCaretRect() {
-            guard let tv = textView, let scroll = tv.enclosingScrollView else {
+            guard let tv = textView, let scroll = tv.enclosingScrollView,
+                  let lm = tv.layoutManager, let tc = tv.textContainer else {
                 parent.caretRect = .zero
                 return
             }
@@ -2893,12 +2934,14 @@ struct GhostTextView: NSViewRepresentable {
             let sel = tv.selectedRange()
             let loc = min(sel.location == NSNotFound ? 0 : sel.location, length)
             let probe = loc > 0 ? NSRange(location: loc - 1, length: 1) : NSRange(location: 0, length: 0)
-            let rect = tv.firstRect(forCharacterRange: probe, actualRange: nil)
-            let clip = scroll.contentView
-            let caretX = loc > 0 ? rect.maxX : rect.minX
-            let visible = CGRect(x: caretX, y: rect.minY, width: 1, height: max(rect.height, 1))
-                .offsetBy(dx: -clip.bounds.origin.x, dy: -clip.bounds.origin.y)
-            parent.caretRect = visible
+            let glyphRange = lm.glyphRange(forCharacterRange: probe, actualCharacterRange: nil)
+            var rect = lm.boundingRect(forGlyphRange: glyphRange, in: tc)
+            let origin = tv.textContainerOrigin
+            rect.origin.x += origin.x
+            rect.origin.y += origin.y
+            let inClip = tv.convert(rect, to: scroll.contentView)
+            let caretX = loc > 0 ? inClip.maxX : inClip.minX
+            parent.caretRect = CGRect(x: caretX, y: inClip.minY, width: 1, height: max(inClip.height, 1))
         }
 
         // MARK: Styling
@@ -2913,7 +2956,10 @@ struct GhostTextView: NSViewRepresentable {
             let font = NSFont(name: parent.fontName, size: parent.fontSize) ?? .systemFont(ofSize: parent.fontSize)
             let color = parent.isDark ? NSColor(white: 0.9, alpha: 1) : NSColor(white: 0.2, alpha: 1)
             let para = NSMutableParagraphStyle()
-            para.lineSpacing = parent.lineSpacing
+            // Fixed line height keeps the caret aligned with the line it sits on.
+            let target = (parent.fontSize * 1.5).rounded()
+            para.minimumLineHeight = target
+            para.maximumLineHeight = target
             return [.font: font, .foregroundColor: color, .paragraphStyle: para]
         }
 
@@ -2941,10 +2987,8 @@ struct GhostTextView: NSViewRepresentable {
 
         private func applyCaret() {
             guard let tv = textView else { return }
-            if phase == .thinking {
-                tv.insertionPointColor = .systemPink
-            } else if parent.armed {
-                tv.insertionPointColor = .systemPurple
+            if phase == .thinking || parent.armed {
+                tv.insertionPointColor = .white
             } else {
                 tv.insertionPointColor = originalInsertionPointColor
             }
@@ -2968,6 +3012,26 @@ struct GhostTextView: NSViewRepresentable {
             let limit = 8000
             return text.count <= limit ? text : String(text.suffix(limit))
         }
+    }
+}
+
+/// A bare spinning ring (no spokes) with a soft white glow.
+struct GlowSpinner: View {
+    @State private var angle: Double = 0
+
+    var body: some View {
+        Circle()
+            .trim(from: 0, to: 0.72)
+            .stroke(Color.white, style: StrokeStyle(lineWidth: 2, lineCap: .round))
+            .frame(width: 15, height: 15)
+            .shadow(color: .white.opacity(0.95), radius: 3)
+            .shadow(color: .white.opacity(0.5), radius: 7)
+            .rotationEffect(.degrees(angle))
+            .onAppear {
+                withAnimation(.linear(duration: 0.9).repeatForever(autoreverses: false)) {
+                    angle = 360
+                }
+            }
     }
 }
 
