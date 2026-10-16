@@ -8,7 +8,8 @@ on:
 
 jobs:
   build:
-    runs-on: macos-15
+    # macOS 26 + Xcode 26 is required for the Foundation Models framework (Apple Intelligence).
+    runs-on: macos-26
     steps:
       - name: Checkout
         uses: actions/checkout@v4

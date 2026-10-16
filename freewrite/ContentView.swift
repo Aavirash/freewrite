@@ -10,6 +10,7 @@ import SwiftUI
 import AppKit
 import UniformTypeIdentifiers
 import PDFKit
+import FoundationModels
 
 enum EntryType {
     case text
@@ -139,6 +140,8 @@ struct ContentView: View {
     @State private var videoPermissionPopoverFallbackMessage: String? = nil
     @State private var keyboardMonitor: Any? = nil
     @State private var lightBox = LightBoxController()
+    @State private var ghostArmed = false
+    @State private var ghostEngine = GhostEngineBox()
     let timer = Timer.publish(every: 1, on: .main, in: .common).autoconnect()
     let entryHeight: CGFloat = 40
     
@@ -888,21 +891,21 @@ struct ContentView: View {
                         .ignoresSafeArea(edges: .top)
                 } else {
                     // Show text editor for text entries
-                    TextEditor(text: $text)
+                    GhostTextView(
+                        text: $text,
+                        fontName: selectedFont,
+                        fontSize: fontSize,
+                        lineSpacing: lineHeight,
+                        isDark: colorScheme == .dark,
+                        armed: $ghostArmed,
+                        engine: ghostEngine
+                    )
                     .background(Color(colorScheme == .light ? .white : .black))
-                    .font(.custom(selectedFont, size: fontSize))
-                    .foregroundColor(colorScheme == .light ? Color(red: 0.20, green: 0.20, blue: 0.20) : Color(red: 0.9, green: 0.9, blue: 0.9))
-                    .scrollContentBackground(.hidden)
-                    .scrollIndicators(.never)
-                    .lineSpacing(lineHeight)
                     .frame(maxWidth: 650)
                     .padding(.top, 40)
-                    .id("\(selectedFont)-\(fontSize)-\(colorScheme)")
                     .padding(.bottom, bottomNavOpacity > 0 ? navHeight : 0)
-                    .colorScheme(colorScheme)
                     .onAppear {
                         placeholderText = placeholderOptions.randomElement() ?? "Begin writing"
-                        // Removed findSubview code which was causing errors
                     }
                     .overlay(
                         ZStack(alignment: .topLeading) {
@@ -1913,6 +1916,10 @@ struct ContentView: View {
                 showingSidebar.toggle()
             }
             return nil
+        case "g":
+            guard ghostEngine.isAvailable else { return nil }
+            ghostArmed.toggle()
+            return nil
         default:
             return event
         }
@@ -2396,6 +2403,425 @@ final class LightBoxController {
             if !isFullScreen && main.level != .normal {
                 main.level = .normal
             }
+        }
+    }
+}
+
+// MARK: - Ghost writing (on-device Apple Intelligence)
+
+/// Type-erased wrapper so the rest of the app doesn't need availability checks.
+final class GhostEngineBox {
+    let isAvailable: Bool
+    private let suggestImpl: (String, @escaping (String) -> Void, @escaping () -> Void) -> Void
+    private let cancelImpl: () -> Void
+
+    init() {
+        if #available(macOS 26.0, *) {
+            let engine = GhostEngine()
+            isAvailable = engine.isAvailable
+            suggestImpl = { context, onUpdate, onDone in
+                engine.suggest(context: context, onUpdate: onUpdate, onDone: onDone)
+            }
+            cancelImpl = { engine.cancel() }
+        } else {
+            isAvailable = false
+            suggestImpl = { _, _, onDone in onDone() }
+            cancelImpl = {}
+        }
+    }
+
+    func suggest(context: String, onUpdate: @escaping (String) -> Void, onDone: @escaping () -> Void) {
+        suggestImpl(context, onUpdate, onDone)
+    }
+
+    func cancel() { cancelImpl() }
+}
+
+/// Streams short continuations from the on-device Apple Foundation Model.
+@available(macOS 26.0, *)
+final class GhostEngine {
+    private var task: Task<Void, Never>?
+
+    static let instructions = """
+    You are a quiet, invisible writing companion inside a freewriting app. \
+    The writer shares the text they have written so far. Continue it with the next few words \
+    they would most plausibly write next, in their own voice and rhythm. \
+    Output ONLY the continuation: never repeat or restate their text, no quotation marks, \
+    no labels, no explanation. Keep it under 10 words.
+    """
+
+    var isAvailable: Bool {
+        SystemLanguageModel.default.isAvailable
+    }
+
+    func cancel() {
+        task?.cancel()
+        task = nil
+    }
+
+    func suggest(context: String, onUpdate: @escaping (String) -> Void, onDone: @escaping () -> Void) {
+        cancel()
+        guard case .available = SystemLanguageModel.default.availability else {
+            onDone()
+            return
+        }
+        let instructions = GhostEngine.instructions
+        task = Task {
+            let session = LanguageModelSession(instructions: instructions)
+            do {
+                let stream = session.streamResponse(to: context)
+                for try await partial in stream {
+                    if Task.isCancelled { return }
+                    let text = partial.content
+                    await MainActor.run { onUpdate(text) }
+                }
+            } catch {
+                // Ghost simply doesn't appear on failure.
+            }
+            await MainActor.run { onDone() }
+        }
+    }
+}
+
+/// NSTextView subclass that hands Tab / Escape / clicks to the coordinator first.
+final class GhostNSTextView: NSTextView {
+    var onTab: (() -> Bool)?
+    var onEscape: (() -> Bool)?
+    var onMouseDown: (() -> Void)?
+
+    override func keyDown(with event: NSEvent) {
+        let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+        if event.keyCode == 48, flags.isEmpty, let onTab, onTab() { return }        // Tab
+        if event.keyCode == 53, let onEscape, onEscape() { return }                    // Escape
+        super.keyDown(with: event)
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        onMouseDown?()
+        super.mouseDown(with: event)
+    }
+}
+
+/// A minimal NSTextView-backed editor that renders on-device "ghost" suggestions
+/// after the caret: dimmed, in the selected font/size, never stealing the caret.
+struct GhostTextView: NSViewRepresentable {
+    @Binding var text: String
+    let fontName: String
+    let fontSize: CGFloat
+    let lineSpacing: CGFloat
+    let isDark: Bool
+    @Binding var armed: Bool
+    let engine: GhostEngineBox
+
+    func makeCoordinator() -> Coordinator { Coordinator(self) }
+
+    func makeNSView(context: Context) -> NSScrollView {
+        let textView = GhostNSTextView(frame: NSRect(x: 0, y: 0, width: 400, height: 600))
+        textView.delegate = context.coordinator
+        textView.isEditable = true
+        textView.isSelectable = true
+        textView.isRichText = false
+        textView.allowsUndo = true
+        textView.drawsBackground = false
+        textView.backgroundColor = .clear
+        textView.isVerticallyResizable = true
+        textView.isHorizontallyResizable = false
+        textView.autoresizingMask = [.width]
+        textView.minSize = NSSize(width: 0, height: 0)
+        textView.maxSize = NSSize(width: CGFloat.greatestFiniteMagnitude, height: CGFloat.greatestFiniteMagnitude)
+        textView.textContainer?.widthTracksTextView = true
+        textView.textContainer?.lineFragmentPadding = 5
+        textView.textContainerInset = NSSize(width: 0, height: 0)
+        textView.isAutomaticQuoteSubstitutionEnabled = false
+        textView.isAutomaticDashSubstitutionEnabled = false
+        textView.isAutomaticTextReplacementEnabled = false
+        textView.isAutomaticSpellingCorrectionEnabled = false
+        textView.isContinuousSpellCheckingEnabled = false
+        textView.isGrammarCheckingEnabled = false
+        textView.isAutomaticLinkDetectionEnabled = false
+        textView.smartInsertDeleteEnabled = false
+
+        let scrollView = NSScrollView()
+        scrollView.documentView = textView
+        scrollView.drawsBackground = false
+        scrollView.hasVerticalScroller = false
+        scrollView.hasHorizontalScroller = false
+        scrollView.autohidesScrollers = true
+        scrollView.scrollerStyle = .overlay
+
+        context.coordinator.textView = textView
+        context.coordinator.originalInsertionPointColor = textView.insertionPointColor
+        context.coordinator.onSetup(initialText: text)
+
+        textView.onTab = { [weak coordinator = context.coordinator] in
+            coordinator?.acceptGhost() ?? false
+        }
+        textView.onEscape = { [weak coordinator = context.coordinator] in
+            coordinator?.escapePressed() ?? false
+        }
+        textView.onMouseDown = { [weak coordinator = context.coordinator] in
+            coordinator?.clearGhostForClick()
+        }
+
+        DispatchQueue.main.async {
+            textView.window?.makeFirstResponder(textView)
+        }
+        return scrollView
+    }
+
+    func updateNSView(_ nsView: NSScrollView, context: Context) {
+        context.coordinator.parent = self
+        context.coordinator.refresh()
+    }
+
+    static func dismantleNSView(_ nsView: NSScrollView, coordinator: Coordinator) {
+        coordinator.parent.engine.cancel()
+    }
+
+    final class Coordinator: NSObject, NSTextViewDelegate {
+        var parent: GhostTextView
+        weak var textView: GhostNSTextView?
+        var originalInsertionPointColor: NSColor = .black
+
+        private let ghostKey = NSAttributedString.Key("freewrite.ghost")
+        private var ghostRange: NSRange?
+        private var ghostAnchor: Int = 0
+        private var pauseToken = 0
+        private var isManipulatingGhost = false
+        private var lastReportedText = ""
+        private var lastStyleKey = ""
+        private var lastArmed = false
+        private var isGenerating = false
+
+        init(_ parent: GhostTextView) {
+            self.parent = parent
+        }
+
+        func onSetup(initialText: String) {
+            guard let tv = textView else { return }
+            isManipulatingGhost = true
+            tv.string = initialText
+            isManipulatingGhost = false
+            lastReportedText = initialText
+            lastStyleKey = ""
+            applyStyle()
+            applyCaret()
+            tv.setSelectedRange(NSRange(location: (initialText as NSString).length, length: 0))
+        }
+
+        func refresh() {
+            guard let tv = textView else { return }
+            let styleKey = "\(parent.fontName)|\(parent.fontSize)|\(parent.isDark)|\(parent.lineSpacing)"
+            if styleKey != lastStyleKey {
+                applyStyle()
+            }
+            if parent.text != lastReportedText {
+                setExternalText(parent.text)
+            }
+            if parent.armed, !lastArmed {
+                scheduleSuggestion()
+            }
+            if !parent.armed, lastArmed {
+                parent.engine.cancel()
+                removeGhost()
+                isGenerating = false
+            }
+            lastArmed = parent.armed
+            applyCaret()
+            _ = tv
+        }
+
+        // MARK: NSTextViewDelegate
+
+        func textDidChange(_ notification: Notification) {
+            guard !isManipulatingGhost, let tv = textView else { return }
+            if ghostRange != nil { removeGhost() }
+            let real = tv.string
+            lastReportedText = real
+            parent.text = real
+            scheduleSuggestion()
+        }
+
+        func textView(_ textView: NSTextView, shouldChangeTextIn affectedCharRange: NSRange, replacementString: String?) -> Bool {
+            if ghostRange != nil {
+                parent.engine.cancel()
+                isGenerating = false
+                removeGhost()
+            }
+            return true
+        }
+
+        // MARK: Ghost lifecycle
+
+        private func scheduleSuggestion() {
+            guard parent.armed, parent.engine.isAvailable else { return }
+            pauseToken += 1
+            let token = pauseToken
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) { [weak self] in
+                guard let self, token == self.pauseToken, self.parent.armed else { return }
+                self.requestGhost()
+            }
+        }
+
+        private func requestGhost() {
+            guard parent.armed, parent.engine.isAvailable, let tv = textView else { return }
+            let ns = tv.string as NSString
+            guard tv.selectedRange().length == 0 else { return }
+            let caret = min(tv.selectedRange().location, ns.length)
+            let context = buildContext(ns.substring(to: caret))
+            guard !context.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
+
+            ghostAnchor = caret
+            isGenerating = true
+            applyCaret()
+
+            parent.engine.suggest(context: context, onUpdate: { [weak self] partial in
+                guard let self, let tv = self.textView else { return }
+                guard self.parent.armed else {
+                    self.parent.engine.cancel()
+                    return
+                }
+                guard tv.selectedRange().length == 0, tv.selectedRange().location == self.ghostAnchor else {
+                    self.parent.engine.cancel()
+                    return
+                }
+                self.renderGhost(partial)
+            }, onDone: { [weak self] in
+                guard let self else { return }
+                self.isGenerating = false
+                self.applyCaret()
+            })
+        }
+
+        private func renderGhost(_ raw: String) {
+            guard let tv = textView else { return }
+            let cleaned = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+            isManipulatingGhost = true
+            if let gr = ghostRange {
+                tv.textStorage?.replaceCharacters(in: gr, with: "")
+                ghostRange = nil
+            }
+            if !cleaned.isEmpty {
+                let length = (tv.string as NSString).length
+                let insertAt = min(ghostAnchor, length)
+                let attributed = NSAttributedString(string: " " + cleaned, attributes: ghostAttributes())
+                tv.textStorage?.replaceCharacters(in: NSRange(location: insertAt, length: 0), with: attributed)
+                ghostRange = NSRange(location: insertAt, length: attributed.length)
+                tv.setSelectedRange(NSRange(location: insertAt, length: 0))
+            }
+            isManipulatingGhost = false
+        }
+
+        private func removeGhost() {
+            guard let tv = textView, let gr = ghostRange else { return }
+            isManipulatingGhost = true
+            tv.textStorage?.replaceCharacters(in: gr, with: "")
+            isManipulatingGhost = false
+            ghostRange = nil
+            let length = (tv.string as NSString).length
+            if tv.selectedRange().location > length {
+                tv.setSelectedRange(NSRange(location: length, length: 0))
+            }
+        }
+
+        func acceptGhost() -> Bool {
+            guard let tv = textView, let gr = ghostRange else { return false }
+            isManipulatingGhost = true
+            tv.textStorage?.removeAttribute(ghostKey, range: gr)
+            isManipulatingGhost = false
+            ghostRange = nil
+            let end = gr.location + gr.length
+            tv.setSelectedRange(NSRange(location: end, length: 0))
+            let real = tv.string
+            lastReportedText = real
+            parent.text = real
+            parent.engine.cancel()
+            isGenerating = false
+            applyCaret()
+            return true
+        }
+
+        func escapePressed() -> Bool {
+            let hadGhost = ghostRange != nil
+            parent.engine.cancel()
+            removeGhost()
+            isGenerating = false
+            applyCaret()
+            if parent.armed {
+                parent.armed = false
+                return true
+            }
+            return hadGhost
+        }
+
+        func clearGhostForClick() {
+            guard ghostRange != nil else { return }
+            parent.engine.cancel()
+            removeGhost()
+            isGenerating = false
+            applyCaret()
+        }
+
+        private func setExternalText(_ newText: String) {
+            guard let tv = textView else { return }
+            removeGhost()
+            isManipulatingGhost = true
+            tv.string = newText
+            isManipulatingGhost = false
+            lastReportedText = newText
+            lastStyleKey = ""
+            applyStyle()
+            applyCaret()
+            tv.setSelectedRange(NSRange(location: (newText as NSString).length, length: 0))
+        }
+
+        // MARK: Styling
+
+        private func baseAttributes() -> [NSAttributedString.Key: Any] {
+            let font = NSFont(name: parent.fontName, size: parent.fontSize) ?? .systemFont(ofSize: parent.fontSize)
+            let color = parent.isDark ? NSColor(white: 0.9, alpha: 1) : NSColor(white: 0.2, alpha: 1)
+            let para = NSMutableParagraphStyle()
+            para.lineSpacing = parent.lineSpacing
+            return [.font: font, .foregroundColor: color, .paragraphStyle: para]
+        }
+
+        private func ghostAttributes() -> [NSAttributedString.Key: Any] {
+            var attrs = baseAttributes()
+            attrs[.foregroundColor] = parent.isDark
+                ? NSColor(white: 1.0, alpha: 0.32)
+                : NSColor(white: 0.0, alpha: 0.28)
+            attrs[ghostKey] = true
+            return attrs
+        }
+
+        private func applyStyle() {
+            guard let tv = textView else { return }
+            removeGhost()
+            isManipulatingGhost = true
+            let attrs = baseAttributes()
+            tv.font = (attrs[.font] as? NSFont) ?? .systemFont(ofSize: parent.fontSize)
+            tv.typingAttributes = attrs
+            let full = NSRange(location: 0, length: (tv.string as NSString).length)
+            tv.textStorage?.setAttributes(attrs, range: full)
+            isManipulatingGhost = false
+            lastStyleKey = "\(parent.fontName)|\(parent.fontSize)|\(parent.isDark)|\(parent.lineSpacing)"
+        }
+
+        private func applyCaret() {
+            guard let tv = textView else { return }
+            if isGenerating {
+                tv.insertionPointColor = .systemPink
+            } else if parent.armed {
+                tv.insertionPointColor = .systemPurple
+            } else {
+                tv.insertionPointColor = originalInsertionPointColor
+            }
+        }
+
+        private func buildContext(_ text: String) -> String {
+            let limit = 8000
+            let clipped = text.count <= limit ? text : String(text.suffix(limit))
+            return "My writing so far:\n\n\(clipped)\n\nContinue from exactly where this leaves off."
         }
     }
 }
